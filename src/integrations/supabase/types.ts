@@ -20,10 +20,6 @@ export type Database = {
           created_at: string
           equity: number
           id: string
-          last_liquidation_check: string | null
-          maintenance_margin: number
-          margin_call_at: string | null
-          margin_level: number | null
           max_drawdown_pct: number
           participant_id: string
           peak_equity: number
@@ -36,10 +32,6 @@ export type Database = {
           created_at?: string
           equity?: number
           id?: string
-          last_liquidation_check?: string | null
-          maintenance_margin?: number
-          margin_call_at?: string | null
-          margin_level?: number | null
           max_drawdown_pct?: number
           participant_id: string
           peak_equity?: number
@@ -52,10 +44,6 @@ export type Database = {
           created_at?: string
           equity?: number
           id?: string
-          last_liquidation_check?: string | null
-          maintenance_margin?: number
-          margin_call_at?: string | null
-          margin_level?: number | null
           max_drawdown_pct?: number
           participant_id?: string
           peak_equity?: number
@@ -150,9 +138,6 @@ export type Database = {
           competition_id: string
           created_at: string
           id: string
-          liquidation_pct: number
-          maintenance_margin_pct: number
-          margin_call_pct: number
           max_drawdown_pct: number
           max_leverage_global: number
           max_position_pct: number
@@ -164,9 +149,6 @@ export type Database = {
           competition_id: string
           created_at?: string
           id?: string
-          liquidation_pct?: number
-          maintenance_margin_pct?: number
-          margin_call_pct?: number
           max_drawdown_pct?: number
           max_leverage_global?: number
           max_position_pct?: number
@@ -178,9 +160,6 @@ export type Database = {
           competition_id?: string
           created_at?: string
           id?: string
-          liquidation_pct?: number
-          maintenance_margin_pct?: number
-          margin_call_pct?: number
           max_drawdown_pct?: number
           max_leverage_global?: number
           max_position_pct?: number
@@ -367,48 +346,6 @@ export type Database = {
         }
         Relationships: []
       }
-      liquidation_events: {
-        Row: {
-          account_id: string
-          competition_id: string
-          id: string
-          liquidation_price: number
-          margin_level_after: number | null
-          margin_level_before: number
-          position_id: string
-          quantity: number
-          realized_pnl: number
-          trigger_price: number
-          triggered_at: string
-        }
-        Insert: {
-          account_id: string
-          competition_id: string
-          id?: string
-          liquidation_price: number
-          margin_level_after?: number | null
-          margin_level_before: number
-          position_id: string
-          quantity: number
-          realized_pnl: number
-          trigger_price: number
-          triggered_at?: string
-        }
-        Update: {
-          account_id?: string
-          competition_id?: string
-          id?: string
-          liquidation_price?: number
-          margin_level_after?: number | null
-          margin_level_before?: number
-          position_id?: string
-          quantity?: number
-          realized_pnl?: number
-          trigger_price?: number
-          triggered_at?: string
-        }
-        Relationships: []
-      }
       market_candles: {
         Row: {
           close: number
@@ -491,117 +428,57 @@ export type Database = {
           },
         ]
       }
-      order_state_history: {
-        Row: {
-          created_at: string
-          from_status: string | null
-          id: string
-          metadata: Json | null
-          order_id: string
-          reason: string | null
-          to_status: string
-        }
-        Insert: {
-          created_at?: string
-          from_status?: string | null
-          id?: string
-          metadata?: Json | null
-          order_id: string
-          reason?: string | null
-          to_status: string
-        }
-        Update: {
-          created_at?: string
-          from_status?: string | null
-          id?: string
-          metadata?: Json | null
-          order_id?: string
-          reason?: string | null
-          to_status?: string
-        }
-        Relationships: []
-      }
       orders: {
         Row: {
           account_id: string
-          avg_fill_price: number | null
-          cancelled_at: string | null
-          commission: number | null
           filled_at: string | null
           filled_price: number | null
-          filled_quantity: number | null
           id: string
           instrument_id: string
           leverage: number
           margin_used: number | null
           order_type: Database["public"]["Enums"]["order_type"]
           quantity: number
-          reject_reason: string | null
-          rejected_at: string | null
-          remaining_quantity: number | null
           requested_at: string
           requested_price: number | null
-          sent_at: string | null
           side: Database["public"]["Enums"]["order_side"]
-          slippage: number | null
           status: Database["public"]["Enums"]["order_status"]
           stop_loss: number | null
           take_profit: number | null
-          validated_at: string | null
         }
         Insert: {
           account_id: string
-          avg_fill_price?: number | null
-          cancelled_at?: string | null
-          commission?: number | null
           filled_at?: string | null
           filled_price?: number | null
-          filled_quantity?: number | null
           id?: string
           instrument_id: string
           leverage?: number
           margin_used?: number | null
           order_type?: Database["public"]["Enums"]["order_type"]
           quantity: number
-          reject_reason?: string | null
-          rejected_at?: string | null
-          remaining_quantity?: number | null
           requested_at?: string
           requested_price?: number | null
-          sent_at?: string | null
           side: Database["public"]["Enums"]["order_side"]
-          slippage?: number | null
           status?: Database["public"]["Enums"]["order_status"]
           stop_loss?: number | null
           take_profit?: number | null
-          validated_at?: string | null
         }
         Update: {
           account_id?: string
-          avg_fill_price?: number | null
-          cancelled_at?: string | null
-          commission?: number | null
           filled_at?: string | null
           filled_price?: number | null
-          filled_quantity?: number | null
           id?: string
           instrument_id?: string
           leverage?: number
           margin_used?: number | null
           order_type?: Database["public"]["Enums"]["order_type"]
           quantity?: number
-          reject_reason?: string | null
-          rejected_at?: string | null
-          remaining_quantity?: number | null
           requested_at?: string
           requested_price?: number | null
-          sent_at?: string | null
           side?: Database["public"]["Enums"]["order_side"]
-          slippage?: number | null
           status?: Database["public"]["Enums"]["order_status"]
           stop_loss?: number | null
           take_profit?: number | null
-          validated_at?: string | null
         }
         Relationships: [
           {
@@ -627,13 +504,9 @@ export type Database = {
           current_price: number | null
           entry_price: number
           id: string
-          initial_margin: number | null
           instrument_id: string
           leverage: number
-          liquidation_price: number | null
-          maintenance_margin: number | null
           margin_used: number
-          notional_value: number | null
           opened_at: string
           quantity: number
           realized_pnl: number
@@ -649,13 +522,9 @@ export type Database = {
           current_price?: number | null
           entry_price: number
           id?: string
-          initial_margin?: number | null
           instrument_id: string
           leverage?: number
-          liquidation_price?: number | null
-          maintenance_margin?: number | null
           margin_used: number
-          notional_value?: number | null
           opened_at?: string
           quantity: number
           realized_pnl?: number
@@ -671,13 +540,9 @@ export type Database = {
           current_price?: number | null
           entry_price?: number
           id?: string
-          initial_margin?: number | null
           instrument_id?: string
           leverage?: number
-          liquidation_price?: number | null
-          maintenance_margin?: number | null
           margin_used?: number
-          notional_value?: number | null
           opened_at?: string
           quantity?: number
           realized_pnl?: number
@@ -995,16 +860,7 @@ export type Database = {
         | "ended"
         | "cancelled"
       order_side: "buy" | "sell"
-      order_status:
-        | "pending"
-        | "filled"
-        | "cancelled"
-        | "rejected"
-        | "new"
-        | "validated"
-        | "sent"
-        | "partially_filled"
-        | "expired"
+      order_status: "pending" | "filled" | "cancelled" | "rejected"
       order_type: "market" | "limit" | "stop"
       participant_status: "active" | "disqualified" | "withdrawn"
       position_status: "open" | "closed" | "liquidated"
@@ -1156,17 +1012,7 @@ export const Constants = {
         "cancelled",
       ],
       order_side: ["buy", "sell"],
-      order_status: [
-        "pending",
-        "filled",
-        "cancelled",
-        "rejected",
-        "new",
-        "validated",
-        "sent",
-        "partially_filled",
-        "expired",
-      ],
+      order_status: ["pending", "filled", "cancelled", "rejected"],
       order_type: ["market", "limit", "stop"],
       participant_status: ["active", "disqualified", "withdrawn"],
       position_status: ["open", "closed", "liquidated"],
