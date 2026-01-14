@@ -599,7 +599,7 @@ export class TradeArenaBroker {
         .from('orders')
         .select('*, instruments(symbol)')
         .eq('account_id', this.config.accountId)
-        .in('status', ['pending', 'new', 'validated', 'sent', 'partially_filled']);
+        .eq('status', 'pending');
 
       if (orders) {
         orders.forEach((order: any) => {
