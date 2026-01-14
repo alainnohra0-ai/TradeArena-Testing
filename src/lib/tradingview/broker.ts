@@ -3,6 +3,12 @@
  * 
  * This broker connects the TradingView charting library to our Supabase backend,
  * enabling real trading functionality with positions, orders, and bracket orders.
+ * 
+ * FIXED: Account Manager widget blank issue
+ * - Improved watched value implementation with proper callbacks
+ * - Added force initial update to ensure data loads
+ * - Enhanced logging for debugging
+ * - Fixed formatter names to use string literals
  */
 
 import { supabase } from "@/integrations/supabase/client";
@@ -157,6 +163,15 @@ export class TradeArenaBroker {
     this.config = config;
     
     console.log('[TradeArenaBroker] Initializing with config:', config);
+    console.log('[TradeArenaBroker] Host capabilities:', {
+      hasFactory: !!host.factory,
+      hasCreateWatchedValue: !!host.factory?.createWatchedValue,
+      hasCurrentAccountUpdate: !!host.currentAccountUpdate,
+      hasOrderUpdate: !!host.orderUpdate,
+      hasPositionUpdate: !!host.positionUpdate,
+      hasOrdersFullUpdate: !!host.ordersFullUpdate,
+      hasPositionsUpdate: !!host.positionsUpdate,
+    });
     
     // Create watched values using host factory (required by TradingView)
     if (host.factory?.createWatchedValue) {
@@ -165,38 +180,113 @@ export class TradeArenaBroker {
       this._plValue = host.factory.createWatchedValue(this._accountManagerData.pl);
       console.log('[TradeArenaBroker] Created watched values via host.factory');
     } else {
-      // Fallback: create simple watched value objects
-      console.warn('[TradeArenaBroker] host.factory.createWatchedValue not available, using fallback');
-      this._balanceValue = this.createSimpleWatchedValue(this._accountManagerData.balance);
-      this._equityValue = this.createSimpleWatchedValue(this._accountManagerData.equity);
-      this._plValue = this.createSimpleWatchedValue(this._accountManagerData.pl);
+      // Fallback: create enhanced watched value objects
+      console.warn('[TradeArenaBroker] host.factory.createWatchedValue not available, using enhanced fallback');
+      this._balanceValue = this.createEnhancedWatchedValue(this._accountManagerData.balance);
+      this._equityValue = this.createEnhancedWatchedValue(this._accountManagerData.equity);
+      this._plValue = this.createEnhancedWatchedValue(this._accountManagerData.pl);
     }
+    
+    console.log('[TradeArenaBroker] Initial watched values:', {
+      balance: this._balanceValue?.value?.(),
+      equity: this._equityValue?.value?.(),
+      pl: this._plValue?.value?.(),
+    });
 
-    // Load initial data
-    this.loadAccountData();
-    this.loadPositions();
-    this.loadOrders();
+    // Load initial data and force update
+    this.initializeData();
   }
   
-  // Create a simple watched value object that mimics TradingView's IWatchedValue
-  private createSimpleWatchedValue(initialValue: number): any {
+  /**
+   * Create an enhanced watched value object that fully implements TradingView's IWatchedValue interface
+   * with proper subscriber management and error handling
+   */
+  private createEnhancedWatchedValue(initialValue: number): any {
     let currentValue = initialValue;
     const subscribers: Array<(value: number) => void> = [];
     
-    return {
-      value: () => currentValue,
-      setValue: (newValue: number) => {
-        currentValue = newValue;
-        subscribers.forEach(cb => cb(newValue));
+    const watchedValue = {
+      value: () => {
+        return currentValue;
       },
-      subscribe: (callback: (value: number) => void) => {
+      
+      setValue: (newValue: number) => {
+        if (currentValue !== newValue) {
+          const oldValue = currentValue;
+          currentValue = newValue;
+          console.log('[WatchedValue] Value changed:', oldValue, '->', newValue);
+          
+          // Notify all subscribers
+          subscribers.forEach((cb, idx) => {
+            try {
+              cb(newValue);
+            } catch (e) {
+              console.error(`[WatchedValue] Callback ${idx} error:`, e);
+            }
+          });
+        }
+      },
+      
+      subscribe: (callback: (value: number) => void, fireImmediately?: boolean) => {
+        if (typeof callback !== 'function') {
+          console.error('[WatchedValue] subscribe called with non-function:', callback);
+          return () => {};
+        }
+        
         subscribers.push(callback);
+        console.log('[WatchedValue] Subscriber added, total:', subscribers.length);
+        
+        // Fire immediately if requested
+        if (fireImmediately) {
+          try {
+            callback(currentValue);
+          } catch (e) {
+            console.error('[WatchedValue] Initial callback error:', e);
+          }
+        }
+        
+        // Return unsubscribe function
         return () => {
           const idx = subscribers.indexOf(callback);
-          if (idx >= 0) subscribers.splice(idx, 1);
+          if (idx >= 0) {
+            subscribers.splice(idx, 1);
+            console.log('[WatchedValue] Subscriber removed, remaining:', subscribers.length);
+          }
         };
       },
     };
+    
+    return watchedValue;
+  }
+
+  /**
+   * Initialize broker data with retry logic
+   */
+  private async initializeData(): Promise<void> {
+    console.log('[TradeArenaBroker] Starting data initialization...');
+    
+    try {
+      // Load data sequentially to ensure proper initialization
+      await this.loadAccountData();
+      await this.loadPositions();
+      await this.loadOrders();
+      
+      // Force initial update after a brief delay to ensure host is ready
+      setTimeout(() => {
+        console.log('[TradeArenaBroker] Forcing initial account update');
+        this.host.currentAccountUpdate?.();
+      }, 100);
+      
+      console.log('[TradeArenaBroker] Data initialization complete');
+    } catch (error) {
+      console.error('[TradeArenaBroker] Data initialization error:', error);
+      
+      // Retry after delay if initial load fails
+      setTimeout(() => {
+        console.log('[TradeArenaBroker] Retrying data initialization...');
+        this.initializeData();
+      }, 2000);
+    }
   }
 
   // ============= Connection & Account Methods =============
@@ -210,6 +300,7 @@ export class TradeArenaBroker {
   }
 
   async accountsMetainfo(): Promise<any[]> {
+    console.log('[TradeArenaBroker] accountsMetainfo called');
     return [{
       id: this.config.accountId,
       name: 'TradeArena Trading Account',
@@ -379,6 +470,7 @@ export class TradeArenaBroker {
 
       this.host.positionUpdate?.(position, true); // true = removed
       await this.loadPositions();
+      await this.loadAccountData();
     } catch (err) {
       console.error('[TradeArenaBroker] Close position error:', err);
       throw err;
@@ -452,44 +544,49 @@ export class TradeArenaBroker {
   // ============= Account Manager =============
 
   accountManagerInfo(): any {
+    console.log('[TradeArenaBroker] accountManagerInfo called');
+    console.log('[TradeArenaBroker] Current account data:', this._accountManagerData);
+    console.log('[TradeArenaBroker] Watched values:', {
+      balance: this._balanceValue?.value?.(),
+      equity: this._equityValue?.value?.(),
+      pl: this._plValue?.value?.(),
+    });
+    
     // Use watched values for summary (required by TradingView)
+    // Use string literals for formatters (not enum references)
     const summaryProps = [
       {
         text: 'Balance',
         wValue: this._balanceValue,
-        formatter: StandardFormatterName.Fixed,
+        formatter: 'fixed',
         isDefault: true,
       },
       {
         text: 'Equity', 
         wValue: this._equityValue,
-        formatter: StandardFormatterName.Fixed,
+        formatter: 'fixed',
         isDefault: true,
       },
       {
         text: 'P&L',
         wValue: this._plValue,
-        formatter: StandardFormatterName.ProfitInInstrumentCurrency,
+        formatter: 'profitInInstrumentCurrency',
         isDefault: true,
       },
     ];
 
-    return {
-      accountTitle: 'TradeArena Account',
+    // FIXED: Using empty pages array - TradingView requires this property to exist
+    // TradingView expects pages property but we provide empty array (no custom pages)
+    const info = {
+      accountTitle: this._accountManagerData.title,
       summary: summaryProps,
       orderColumns: this.getOrderColumns(),
       positionColumns: this.getPositionColumns(),
-      pages: [{
-        id: 'accountsummary',
-        title: 'Account Summary',
-        tables: [{
-          id: 'accountsummary',
-          columns: this.getAccountSummaryColumns(),
-          getData: () => Promise.resolve([this._accountManagerData]),
-          initialSorting: { property: 'balance', asc: false },
-        }],
-      }],
+      pages: [],
     };
+    
+    console.log('[TradeArenaBroker] Returning accountManagerInfo:', info);
+    return info;
   }
 
   executions(_symbol: string): Promise<any[]> {
@@ -519,19 +616,34 @@ export class TradeArenaBroker {
         this._accountManagerData.equity = data.equity;
         this._accountManagerData.pl = data.equity - data.balance;
         
-        // Update watched values
-        this._balanceValue?.setValue?.(data.balance);
-        this._equityValue?.setValue?.(data.equity);
-        this._plValue?.setValue?.(data.equity - data.balance);
+        console.log('[TradeArenaBroker] Account data loaded:', this._accountManagerData);
         
-        console.log('[TradeArenaBroker] Account loaded:', { 
-          balance: data.balance, 
-          equity: data.equity,
-          pl: data.equity - data.balance
+        // Update watched values with setValue
+        if (this._balanceValue?.setValue) {
+          this._balanceValue.setValue(data.balance);
+          console.log('[TradeArenaBroker] Balance value updated to:', data.balance);
+        }
+        if (this._equityValue?.setValue) {
+          this._equityValue.setValue(data.equity);
+          console.log('[TradeArenaBroker] Equity value updated to:', data.equity);
+        }
+        if (this._plValue?.setValue) {
+          this._plValue.setValue(data.equity - data.balance);
+          console.log('[TradeArenaBroker] P&L value updated to:', data.equity - data.balance);
+        }
+        
+        // Verify values were set correctly
+        console.log('[TradeArenaBroker] Verified watched values:', {
+          balance: this._balanceValue?.value?.(),
+          equity: this._equityValue?.value?.(),
+          pl: this._plValue?.value?.(),
         });
         
         // Notify host of account update
-        this.host.currentAccountUpdate?.();
+        if (this.host.currentAccountUpdate) {
+          this.host.currentAccountUpdate();
+          console.log('[TradeArenaBroker] Notified host of account update');
+        }
       } else {
         console.warn('[TradeArenaBroker] No account found for id:', this.config.accountId);
       }
@@ -542,13 +654,22 @@ export class TradeArenaBroker {
 
   private async loadPositions(): Promise<void> {
     try {
-      const { data: positions } = await supabase
+      console.log('[TradeArenaBroker] Loading positions for account:', this.config.accountId);
+      
+      const { data: positions, error } = await supabase
         .from('positions')
         .select('*, instruments(symbol)')
         .eq('account_id', this.config.accountId)
         .eq('status', 'open');
 
+      if (error) {
+        console.error('[TradeArenaBroker] Positions query error:', error);
+        return;
+      }
+
       if (positions) {
+        console.log('[TradeArenaBroker] Loaded', positions.length, 'positions');
+        
         // Clear existing
         this._positionsArray.length = 0;
         Object.keys(this._positionById).forEach(k => delete this._positionById[k]);
@@ -585,8 +706,14 @@ export class TradeArenaBroker {
         });
 
         // Notify host of full update
-        this.host.positionsUpdate?.();
-        this.host.ordersFullUpdate?.();
+        if (this.host.positionsUpdate) {
+          this.host.positionsUpdate();
+          console.log('[TradeArenaBroker] Notified host of positions update');
+        }
+        if (this.host.ordersFullUpdate) {
+          this.host.ordersFullUpdate();
+          console.log('[TradeArenaBroker] Notified host of orders full update');
+        }
       }
     } catch (err) {
       console.error('[TradeArenaBroker] Load positions error:', err);
@@ -595,13 +722,22 @@ export class TradeArenaBroker {
 
   private async loadOrders(): Promise<void> {
     try {
-      const { data: orders } = await supabase
+      console.log('[TradeArenaBroker] Loading orders for account:', this.config.accountId);
+      
+      const { data: orders, error } = await supabase
         .from('orders')
         .select('*, instruments(symbol)')
         .eq('account_id', this.config.accountId)
         .eq('status', 'pending');
 
+      if (error) {
+        console.error('[TradeArenaBroker] Orders query error:', error);
+        return;
+      }
+
       if (orders) {
+        console.log('[TradeArenaBroker] Loaded', orders.length, 'orders');
+        
         orders.forEach((order: any) => {
           const instrument = Array.isArray(order.instruments) ? order.instruments[0] : order.instruments;
           const tvOrder: TVOrder = {
@@ -769,34 +905,34 @@ export class TradeArenaBroker {
 
   private getOrderColumns(): any[] {
     return [
-      { label: 'Symbol', id: 'symbol', dataFields: ['symbol'], formatter: StandardFormatterName.Symbol, alignment: 'left' },
-      { label: 'Side', id: 'side', dataFields: ['side'], formatter: StandardFormatterName.Side, alignment: 'left' },
-      { label: 'Type', id: 'type', dataFields: ['type'], formatter: StandardFormatterName.OrderType, alignment: 'left' },
-      { label: 'Qty', id: 'qty', dataFields: ['qty'], formatter: StandardFormatterName.FormatQuantity, alignment: 'right' },
-      { label: 'Limit', id: 'limitPrice', dataFields: ['limitPrice'], formatter: StandardFormatterName.FormatPrice, alignment: 'right' },
-      { label: 'Stop', id: 'stopPrice', dataFields: ['stopPrice'], formatter: StandardFormatterName.FormatPrice, alignment: 'right' },
-      { label: 'Status', id: 'status', dataFields: ['status'], formatter: StandardFormatterName.OrderStatus, alignment: 'left' },
+      { label: 'Symbol', id: 'symbol', dataFields: ['symbol'], formatter: 'symbol', alignment: 'left' },
+      { label: 'Side', id: 'side', dataFields: ['side'], formatter: 'side', alignment: 'left' },
+      { label: 'Type', id: 'type', dataFields: ['type'], formatter: 'orderType', alignment: 'left' },
+      { label: 'Qty', id: 'qty', dataFields: ['qty'], formatter: 'formatQuantity', alignment: 'right' },
+      { label: 'Limit', id: 'limitPrice', dataFields: ['limitPrice'], formatter: 'formatPrice', alignment: 'right' },
+      { label: 'Stop', id: 'stopPrice', dataFields: ['stopPrice'], formatter: 'formatPrice', alignment: 'right' },
+      { label: 'Status', id: 'status', dataFields: ['status'], formatter: 'orderStatus', alignment: 'left' },
     ];
   }
 
   private getPositionColumns(): any[] {
     return [
-      { label: 'Symbol', id: 'symbol', dataFields: ['symbol'], formatter: StandardFormatterName.Symbol, alignment: 'left' },
-      { label: 'Side', id: 'side', dataFields: ['side'], formatter: StandardFormatterName.PositionSide, alignment: 'left' },
-      { label: 'Qty', id: 'qty', dataFields: ['qty'], formatter: StandardFormatterName.FormatQuantity, alignment: 'right' },
-      { label: 'Avg Price', id: 'avgPrice', dataFields: ['avgPrice', 'price'], formatter: StandardFormatterName.FormatPrice, alignment: 'right' },
-      { label: 'P&L', id: 'pl', dataFields: ['pl'], formatter: StandardFormatterName.ProfitInInstrumentCurrency, alignment: 'right' },
-      { label: 'SL', id: 'stopLoss', dataFields: ['stopLoss'], formatter: StandardFormatterName.FormatPrice, alignment: 'right' },
-      { label: 'TP', id: 'takeProfit', dataFields: ['takeProfit'], formatter: StandardFormatterName.FormatPrice, alignment: 'right' },
+      { label: 'Symbol', id: 'symbol', dataFields: ['symbol'], formatter: 'symbol', alignment: 'left' },
+      { label: 'Side', id: 'side', dataFields: ['side'], formatter: 'positionSide', alignment: 'left' },
+      { label: 'Qty', id: 'qty', dataFields: ['qty'], formatter: 'formatQuantity', alignment: 'right' },
+      { label: 'Avg Price', id: 'avgPrice', dataFields: ['avgPrice', 'price'], formatter: 'formatPrice', alignment: 'right' },
+      { label: 'P&L', id: 'pl', dataFields: ['pl'], formatter: 'profitInInstrumentCurrency', alignment: 'right' },
+      { label: 'SL', id: 'stopLoss', dataFields: ['stopLoss'], formatter: 'formatPrice', alignment: 'right' },
+      { label: 'TP', id: 'takeProfit', dataFields: ['takeProfit'], formatter: 'formatPrice', alignment: 'right' },
     ];
   }
 
   private getAccountSummaryColumns(): any[] {
     return [
-      { label: 'Title', id: 'title', dataFields: ['title'], alignment: 'left', formatter: StandardFormatterName.Fixed },
-      { label: 'Balance', id: 'balance', dataFields: ['balance'], alignment: 'right', formatter: StandardFormatterName.Fixed },
-      { label: 'Equity', id: 'equity', dataFields: ['equity'], alignment: 'right', formatter: StandardFormatterName.Fixed },
-      { label: 'P&L', id: 'pl', dataFields: ['pl'], alignment: 'right', formatter: StandardFormatterName.Fixed },
+      { label: 'Title', id: 'title', dataFields: ['title'], alignment: 'left', formatter: 'fixed' },
+      { label: 'Balance', id: 'balance', dataFields: ['balance'], alignment: 'right', formatter: 'fixed' },
+      { label: 'Equity', id: 'equity', dataFields: ['equity'], alignment: 'right', formatter: 'fixed' },
+      { label: 'P&L', id: 'pl', dataFields: ['pl'], alignment: 'right', formatter: 'fixed' },
     ];
   }
 }
@@ -804,9 +940,15 @@ export class TradeArenaBroker {
 // ============= Broker Factory =============
 
 export function createTradeArenaBrokerFactory(config: BrokerConfig) {
+  console.log('[createTradeArenaBrokerFactory] Creating factory with config:', config);
   return function(host: any) {
+    console.log('[BrokerFactory] Instantiating broker with host:', {
+      hasFactory: !!host?.factory,
+      hasCreateWatchedValue: !!host?.factory?.createWatchedValue,
+    });
     return new TradeArenaBroker(host, config);
   };
 }
 
 export default TradeArenaBroker;
+

@@ -2,6 +2,8 @@
  * TradingView Trading Terminal Component
  * Full integration with TradingView's Trading Platform (orders, positions, etc.)
  * Uses the charting library from trading_platform-master
+ * 
+ * ENHANCED: Added detailed logging for Account Manager debugging
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -118,21 +120,32 @@ export const TradingViewTerminal = ({
         }
 
         console.log("[TradingViewTerminal] Initializing widget...");
+        console.log("[TradingViewTerminal] Config:", {
+          accountId,
+          competitionId,
+          userId: user?.id,
+          symbol,
+        });
 
         // Create custom datafeed with real-time updates
         const datafeed = createDatafeed();
 
         // Create broker factory if we have account info
-        const brokerFactory = accountId && user?.id
-          ? createTradeArenaBrokerFactory({
-              accountId,
-              userId: user.id,
-              competitionId,
-            })
-          : undefined;
+        let brokerFactory;
+        if (accountId && user?.id) {
+          console.log("[TradingViewTerminal] Creating broker factory...");
+          brokerFactory = createTradeArenaBrokerFactory({
+            accountId,
+            userId: user.id,
+            competitionId,
+          });
+          console.log("[TradingViewTerminal] Broker factory created");
+        } else {
+          console.warn("[TradingViewTerminal] No account/user info, broker disabled");
+        }
 
         // Create Trading Terminal widget with all trading features
-        widgetRef.current = new window.TradingView.widget({
+        const widgetConfig = {
           // Basic configuration
           fullscreen: true,
           symbol: symbol,
@@ -212,17 +225,40 @@ export const TradingViewTerminal = ({
               { name: "IOC", value: "IOC" },
             ],
           } : undefined,
-        });
+        };
 
-        console.log("[TradingViewTerminal] Widget initialized successfully");
+        console.log("[TradingViewTerminal] Widget config:", widgetConfig);
+
+        widgetRef.current = new window.TradingView.widget(widgetConfig);
+
+        console.log("[TradingViewTerminal] Widget created:", widgetRef.current);
         setIsReady(true);
 
         widgetRef.current.onChartReady(() => {
-          console.log("[TradingViewTerminal] Chart ready");
+          console.log("[TradingViewTerminal] Chart ready event fired");
+          
+          // Additional logging for broker initialization
+          if (brokerFactory) {
+            console.log("[TradingViewTerminal] Broker should be initialized now");
+            
+            // Try to access broker API if available
+            try {
+              const chart = widgetRef.current.activeChart?.();
+              console.log("[TradingViewTerminal] Active chart:", !!chart);
+              
+              // Log account manager state
+              setTimeout(() => {
+                console.log("[TradingViewTerminal] Delayed check - widget fully initialized");
+              }, 2000);
+            } catch (e) {
+              console.error("[TradingViewTerminal] Error accessing chart:", e);
+            }
+          }
         });
 
         return () => {
           if (widgetRef.current?.remove) {
+            console.log("[TradingViewTerminal] Removing widget");
             widgetRef.current.remove();
           }
         };
@@ -252,6 +288,9 @@ export const TradingViewTerminal = ({
           <div className="text-center">
             <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
             <p className="text-sm text-gray-400">Loading TradingView Terminal...</p>
+            {accountId && (
+              <p className="text-xs text-gray-500 mt-2">Account: {accountId.substring(0, 8)}...</p>
+            )}
           </div>
         </div>
       )}
@@ -262,6 +301,7 @@ export const TradingViewTerminal = ({
           <div className="text-center max-w-md">
             <p className="text-red-500 font-semibold mb-2">Error Loading Terminal</p>
             <p className="text-gray-400 text-sm">{error}</p>
+            <p className="text-xs text-gray-500 mt-4">Check browser console for details</p>
           </div>
         </div>
       )}
@@ -270,3 +310,4 @@ export const TradingViewTerminal = ({
 };
 
 export default TradingViewTerminal;
+
