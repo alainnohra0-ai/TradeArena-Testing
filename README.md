@@ -1,73 +1,201 @@
-# Welcome to your Lovable project
+# TradeArena - Trading Competition Platform
 
-## Project info
+A comprehensive trading competition platform built with React, TypeScript, and Supabase, featuring real-time TradingView integration for live trading.
 
-**URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID
+## Features
 
-## How can I edit this code?
+- 🎯 **Trading Competitions**: Create and manage multi-asset trading competitions
+- 📊 **TradingView Integration**: Full-featured trading terminal with charting
+- 💰 **Multi-Asset Support**: Forex, Indices, Commodities, Crypto, and Stocks
+- 🏆 **Real-time Leaderboards**: Live ranking and performance tracking
+- 💼 **Portfolio Management**: Track positions, orders, and P&L
+- 🔒 **Secure Trading**: Row-level security and proper margin management
+- 📱 **Responsive Design**: Works on desktop and mobile devices
 
-There are several ways of editing your application.
+## Tech Stack
 
-**Use Lovable**
+- **Frontend**: React 18, TypeScript, Vite
+- **UI**: Tailwind CSS, shadcn/ui components
+- **Backend**: Supabase (PostgreSQL + Edge Functions)
+- **Trading**: TradingView Charting Library & Trading Terminal
+- **State Management**: React Context API
+- **Routing**: React Router v6
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
+## Quick Start
 
-Changes made via Lovable will be committed automatically to this repo.
+### Prerequisites
 
-**Use your preferred IDE**
+- Node.js 18+ 
+- npm or bun
+- Supabase account
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+### Installation
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+```bash
+# Clone the repository
+git clone <your-repo-url>
+cd supabase-deploy-hub
 
-Follow these steps:
+# Install dependencies
+npm install
 
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
+# Copy environment variables
+cp .env.example .env
 
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
-
-# Step 3: Install the necessary dependencies.
-npm i
-
-# Step 4: Start the development server with auto-reloading and an instant preview.
-npm run dev
+# Update .env with your Supabase credentials
+VITE_SUPABASE_URL=your-supabase-url
+VITE_SUPABASE_ANON_KEY=your-anon-key
 ```
 
-**Edit a file directly in GitHub**
+### Development
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+```bash
+# Run development server
+npm run dev
 
-**Use GitHub Codespaces**
+# Build for production
+npm run build
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+# Preview production build
+npm run preview
+```
 
-## What technologies are used for this project?
+## Project Structure
 
-This project is built with:
+```
+supabase-deploy-hub/
+├── src/
+│   ├── components/          # React components
+│   │   ├── trading/        # Trading-specific components
+│   │   ├── admin/          # Admin panel components
+│   │   └── ui/             # Reusable UI components
+│   ├── pages/              # Page components
+│   ├── lib/                # Utilities and helpers
+│   │   └── tradingview/    # TradingView broker integration
+│   ├── contexts/           # React contexts
+│   ├── hooks/              # Custom React hooks
+│   └── integrations/       # External integrations
+│       └── supabase/       # Supabase client
+├── supabase/
+│   ├── migrations/         # Database migrations
+│   └── functions/          # Edge Functions
+│       ├── place-order/    # Order placement
+│       ├── close-position/ # Position closing
+│       ├── price-engine/   # Real-time pricing
+│       └── ...
+├── docs/                   # Documentation
+│   ├── TRADING_BACKEND_FIXES.md       # Recent backend fixes
+│   ├── TRADING_WORKFLOW_COMPLETE.md   # Complete trading workflow
+│   └── TRADINGVIEW_*.md               # TradingView integration docs
+└── public/                 # Static assets
+```
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+## Database Schema
 
-## How can I deploy this project?
+The platform uses a comprehensive PostgreSQL schema with:
 
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
+- **Users & Profiles**: Authentication and user management
+- **Competitions**: Competition metadata and rules
+- **Instruments**: Multi-asset trading instruments
+- **Accounts**: Trading accounts per participant
+- **Orders & Positions**: Order management and position tracking
+- **Trades**: Historical trade records
+- **Market Data**: Real-time pricing and candles
+- **Wallets**: User balance management
 
-## Can I connect a custom domain to my Lovable project?
+See [Database Schema Migrations](./supabase/migrations/) for details.
 
-Yes, you can!
+## Trading Features
 
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
+### Order Types
+- ✅ Market Orders
+- ✅ Limit Orders
+- ✅ Stop Orders
+- ✅ Stop-Limit Orders (partial)
 
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+### Position Management
+- ✅ Open/Close positions
+- ✅ Stop Loss & Take Profit brackets
+- ✅ Real-time P&L tracking
+- ✅ Margin management
+- ✅ Leverage configuration
+
+### Risk Management
+- ✅ Maximum drawdown limits
+- ✅ Position size limits
+- ✅ Leverage restrictions
+- ✅ Automatic disqualification on breach
+
+## Recent Updates (2026-01-15)
+
+### Trading Backend Fixes
+- Fixed broker parameter mismatch (symbol → instrument_id)
+- Added instrument caching for performance
+- Created database migrations for missing fields
+- Improved error handling and logging
+- Fixed order cancellation logic
+
+See [TRADING_BACKEND_FIXES.md](./docs/TRADING_BACKEND_FIXES.md) for details.
+
+## Documentation
+
+- [Start Here](./docs/START_HERE.md) - Getting started guide
+- [Trading Workflow](./docs/TRADING_WORKFLOW_COMPLETE.md) - Complete trading flow documentation
+- [Trading Backend Fixes](./docs/TRADING_BACKEND_FIXES.md) - Recent backend improvements
+- [TradingView Integration](./docs/TRADINGVIEW_INTEGRATION.md) - TradingView setup guide
+
+## Environment Variables
+
+```env
+# Supabase
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key
+
+# TradingView (optional)
+VITE_TRADINGVIEW_LIBRARY_PATH=/charting_library/
+```
+
+## Deployment
+
+### Frontend
+The app can be deployed to:
+- Vercel
+- Netlify
+- Lovable
+- Any static hosting service
+
+### Backend (Supabase)
+1. Create a Supabase project
+2. Apply database migrations via SQL Editor
+3. Deploy Edge Functions (if using CLI)
+4. Configure environment variables
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
+
+## License
+
+[Your License Here]
+
+## Support
+
+For issues or questions:
+- Check the [documentation](./docs/)
+- Review [closed issues](../../issues?q=is%3Aissue+is%3Aclosed)
+- Open a new issue
+
+## Acknowledgments
+
+- TradingView for the charting library
+- Supabase for the backend infrastructure
+- shadcn/ui for the component library
+
+---
+
+**Built with ❤️ for competitive trading**
+

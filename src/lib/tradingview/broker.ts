@@ -1,954 +1,607 @@
 /**
- * TradeArena Broker Implementation for TradingView Trading Terminal
+ * TradeArena Broker Implementation - FIXED for Correct Schema
+ * Based on TradingView's trading_platform-master/broker-sample
+ * Adapted for TradeArena's actual Supabase schema
  * 
- * This broker connects the TradingView charting library to our Supabase backend,
- * enabling real trading functionality with positions, orders, and bracket orders.
- * 
- * FIXED: Account Manager widget blank issue
- * - Improved watched value implementation with proper callbacks
- * - Added force initial update to ensure data loads
- * - Enhanced logging for debugging
- * - Fixed formatter names to use string literals
+ * FIXES:
+ * - Proper instrument_id resolution from symbol
+ * - Correct parameter structure for place-order function
+ * - Added leverage handling
+ * - Added instrument caching
  */
 
 import { supabase } from "@/integrations/supabase/client";
+import { toast } from "sonner";
 
-// ============= TradingView Type Definitions =============
-
-export const Side = {
-  Buy: 1 as const,
-  Sell: -1 as const,
-};
-
-export const OrderType = {
-  Market: 1 as const,
-  Limit: 2 as const,
-  Stop: 3 as const,
-  StopLimit: 4 as const,
-};
-
-export const OrderStatus = {
-  Inactive: 1 as const,
-  Placing: 2 as const,
-  Canceled: 3 as const,
-  Filled: 4 as const,
-  Rejected: 5 as const,
-  Working: 6 as const,
-};
-
-export const ParentType = {
-  Order: 1 as const,
-  Position: 2 as const,
-  IndividualPosition: 2 as const,
-};
-
-export const ConnectionStatus = {
-  Connected: 1 as const,
-  Connecting: 2 as const,
-  Disconnected: 3 as const,
-  Error: 4 as const,
-};
-
-export const StopType = {
-  StopLoss: 0 as const,
-  TrailingStop: 1 as const,
-  GuaranteedStop: 2 as const,
-};
-
-export const StandardFormatterName = {
-  Fixed: 'fixed' as const,
-  FormatPrice: 'formatPrice' as const,
-  FormatQuantity: 'formatQuantity' as const,
-  FormatDate: 'formatDate' as const,
-  Pips: 'pips' as const,
-  Percent: 'percent' as const,
-  ProfitInPips: 'profitInPips' as const,
-  ProfitInInstrumentCurrency: 'profitInInstrumentCurrency' as const,
-  Symbol: 'symbol' as const,
-  Side: 'side' as const,
-  OrderType: 'orderType' as const,
-  OrderStatus: 'orderStatus' as const,
-  PositionSide: 'positionSide' as const,
-  IntegerSign: 'integerSign' as const,
-};
-
-// ============= Interfaces =============
-
-interface SimpleMap<TValue> {
-  [key: string]: TValue;
+// TradingView Broker API enums and types
+export enum ConnectionStatus {
+  Connected = 1,
+  Connecting = 2,
+  Disconnected = 3,
+  Error = 4,
 }
 
-interface TVOrder {
+export enum Side {
+  Buy = 1,
+  Sell = -1,
+}
+
+export enum OrderType {
+  Limit = 1,
+  Market = 2,
+  Stop = 3,
+  StopLimit = 4,
+}
+
+export enum OrderStatus {
+  Canceled = 1,
+  Filled = 2,
+  Inactive = 3,
+  Placing = 4,
+  Rejected = 5,
+  Working = 6,
+}
+
+export enum StandardFormatterName {
+  Fixed = "fixed",
+  FormatQuantity = "formatQuantity",
+  FormatPrice = "formatPrice",
+  Profit = "profit",
+  Side = "side",
+  Status = "status",
+  Symbol = "symbol",
+  Type = "type",
+}
+
+export const CommonAccountManagerColumnId = {
+  Symbol: "symbol",
+};
+
+export interface Position {
   id: string;
   symbol: string;
-  side: typeof Side.Buy | typeof Side.Sell;
-  type: number;
   qty: number;
-  status: number;
+  side: Side;
+  avgPrice: number;
+  pl?: number;
+  stopLoss?: number;
+  takeProfit?: number;
+}
+
+export interface Order {
+  id: string;
+  symbol: string;
+  type: OrderType;
+  side: Side;
+  qty: number;
+  status: OrderStatus;
   limitPrice?: number;
   stopPrice?: number;
-  stopType?: number;
-  parentId?: string;
-  parentType?: number;
-  takeProfit?: number;
-  stopLoss?: number;
-  price?: number;
-  avgPrice?: number;
-  last?: number;
-  positionId?: string;
-  isClose?: boolean;
 }
 
-interface TVPosition {
-  id: string;
+export interface PreOrder {
   symbol: string;
-  side: typeof Side.Buy | typeof Side.Sell;
+  type: OrderType;
+  side: Side;
   qty: number;
-  avgPrice: number;
-  pl?: number;
-  takeProfit?: number;
+  limitPrice?: number;
+  stopPrice?: number;
   stopLoss?: number;
+  takeProfit?: number;
+  leverage?: number;
 }
 
-interface TVIndividualPosition {
+export interface Brackets {
+  stopLoss?: number;
+  takeProfit?: number;
+}
+
+export interface InstrumentInfo {
+  qty: { min: number; max: number; step: number };
+  pipSize: number;
+  pipValue: number;
+  minTick: number;
+  description: string;
+}
+
+interface InstrumentCache {
   id: string;
-  symbol: string;
-  side: typeof Side.Buy | typeof Side.Sell;
-  qty: number;
-  price: number;
-  avgPrice: number;
-  pl?: number;
-  takeProfit?: number;
-  stopLoss?: number;
+  leverage: number;
+  contract_size: number;
 }
 
-interface AccountManagerData {
-  title: string;
-  balance: number;
-  equity: number;
-  pl: number;
-}
-
-export interface BrokerConfig {
-  accountId: string;
-  userId: string;
-  competitionId?: string;
-}
-
-// ============= TradeArena Broker Class =============
-
+/**
+ * TradeArena Broker Class
+ */
 export class TradeArenaBroker {
   private host: any;
-  private config: BrokerConfig;
-  private idsCounter: number = 1;
+  private accountId: string;
+  private competitionId: string | undefined;
+  private userId: string;
   
-  private readonly _positionsArray: TVPosition[] = [];
-  private readonly _positionById: SimpleMap<TVPosition> = {};
-  private readonly _orderById: SimpleMap<TVOrder> = {};
+  private balanceValue: any;
+  private equityValue: any;
   
-  // Watched values for TradingView Account Manager (must be IWatchedValue objects)
-  private _balanceValue: any;
-  private _equityValue: any;
-  private _plValue: any;
-  
-  private _accountManagerData = {
-    title: 'TradeArena Account',
-    balance: 100000,
-    equity: 100000,
-    pl: 0,
-  };
+  private pollingInterval: NodeJS.Timeout | null = null;
+  private instrumentCache: Map<string, InstrumentCache> = new Map();
 
-  constructor(host: any, config: BrokerConfig) {
+  constructor(
+    host: any,
+    config: {
+      accountId: string;
+      userId: string;
+      competitionId?: string;
+    }
+  ) {
     this.host = host;
-    this.config = config;
-    
-    console.log('[TradeArenaBroker] Initializing with config:', config);
-    console.log('[TradeArenaBroker] Host capabilities:', {
-      hasFactory: !!host.factory,
-      hasCreateWatchedValue: !!host.factory?.createWatchedValue,
-      hasCurrentAccountUpdate: !!host.currentAccountUpdate,
-      hasOrderUpdate: !!host.orderUpdate,
-      hasPositionUpdate: !!host.positionUpdate,
-      hasOrdersFullUpdate: !!host.ordersFullUpdate,
-      hasPositionsUpdate: !!host.positionsUpdate,
-    });
-    
-    // Create watched values using host factory (required by TradingView)
-    if (host.factory?.createWatchedValue) {
-      this._balanceValue = host.factory.createWatchedValue(this._accountManagerData.balance);
-      this._equityValue = host.factory.createWatchedValue(this._accountManagerData.equity);
-      this._plValue = host.factory.createWatchedValue(this._accountManagerData.pl);
-      console.log('[TradeArenaBroker] Created watched values via host.factory');
-    } else {
-      // Fallback: create enhanced watched value objects
-      console.warn('[TradeArenaBroker] host.factory.createWatchedValue not available, using enhanced fallback');
-      this._balanceValue = this.createEnhancedWatchedValue(this._accountManagerData.balance);
-      this._equityValue = this.createEnhancedWatchedValue(this._accountManagerData.equity);
-      this._plValue = this.createEnhancedWatchedValue(this._accountManagerData.pl);
-    }
-    
-    console.log('[TradeArenaBroker] Initial watched values:', {
-      balance: this._balanceValue?.value?.(),
-      equity: this._equityValue?.value?.(),
-      pl: this._plValue?.value?.(),
-    });
+    this.accountId = config.accountId;
+    this.userId = config.userId;
+    this.competitionId = config.competitionId;
 
-    // Load initial data and force update
-    this.initializeData();
-  }
-  
-  /**
-   * Create an enhanced watched value object that fully implements TradingView's IWatchedValue interface
-   * with proper subscriber management and error handling
-   */
-  private createEnhancedWatchedValue(initialValue: number): any {
-    let currentValue = initialValue;
-    const subscribers: Array<(value: number) => void> = [];
+    // Create watched values
+    this.balanceValue = this.host.factory.createWatchedValue(0);
+    this.equityValue = this.host.factory.createWatchedValue(0);
+
+    // Start polling
+    this.startPolling();
     
-    const watchedValue = {
-      value: () => {
-        return currentValue;
-      },
-      
-      setValue: (newValue: number) => {
-        if (currentValue !== newValue) {
-          const oldValue = currentValue;
-          currentValue = newValue;
-          console.log('[WatchedValue] Value changed:', oldValue, '->', newValue);
-          
-          // Notify all subscribers
-          subscribers.forEach((cb, idx) => {
-            try {
-              cb(newValue);
-            } catch (e) {
-              console.error(`[WatchedValue] Callback ${idx} error:`, e);
-            }
-          });
-        }
-      },
-      
-      subscribe: (callback: (value: number) => void, fireImmediately?: boolean) => {
-        if (typeof callback !== 'function') {
-          console.error('[WatchedValue] subscribe called with non-function:', callback);
-          return () => {};
-        }
-        
-        subscribers.push(callback);
-        console.log('[WatchedValue] Subscriber added, total:', subscribers.length);
-        
-        // Fire immediately if requested
-        if (fireImmediately) {
-          try {
-            callback(currentValue);
-          } catch (e) {
-            console.error('[WatchedValue] Initial callback error:', e);
-          }
-        }
-        
-        // Return unsubscribe function
-        return () => {
-          const idx = subscribers.indexOf(callback);
-          if (idx >= 0) {
-            subscribers.splice(idx, 1);
-            console.log('[WatchedValue] Subscriber removed, remaining:', subscribers.length);
-          }
-        };
-      },
-    };
-    
-    return watchedValue;
+    console.log("[TradeArenaBroker] Initialized", config);
   }
 
-  /**
-   * Initialize broker data with retry logic
-   */
-  private async initializeData(): Promise<void> {
-    console.log('[TradeArenaBroker] Starting data initialization...');
-    
-    try {
-      // Load data sequentially to ensure proper initialization
-      await this.loadAccountData();
-      await this.loadPositions();
-      await this.loadOrders();
-      
-      // Force initial update after a brief delay to ensure host is ready
-      setTimeout(() => {
-        console.log('[TradeArenaBroker] Forcing initial account update');
-        this.host.currentAccountUpdate?.();
-      }, 100);
-      
-      console.log('[TradeArenaBroker] Data initialization complete');
-    } catch (error) {
-      console.error('[TradeArenaBroker] Data initialization error:', error);
-      
-      // Retry after delay if initial load fails
-      setTimeout(() => {
-        console.log('[TradeArenaBroker] Retrying data initialization...');
-        this.initializeData();
-      }, 2000);
-    }
-  }
-
-  // ============= Connection & Account Methods =============
-
-  connectionStatus(): number {
+  connectionStatus(): ConnectionStatus {
     return ConnectionStatus.Connected;
   }
 
   currentAccount(): string {
-    return this.config.accountId;
-  }
-
-  async accountsMetainfo(): Promise<any[]> {
-    console.log('[TradeArenaBroker] accountsMetainfo called');
-    return [{
-      id: this.config.accountId,
-      name: 'TradeArena Trading Account',
-      currency: 'USD',
-    }];
+    return this.accountId;
   }
 
   async isTradable(_symbol: string): Promise<boolean> {
     return true;
   }
 
-  async symbolInfo(symbol: string): Promise<any> {
-    const mintick = await this.host.getSymbolMinTick?.(symbol) || 0.00001;
-    return {
-      qty: { min: 0.01, max: 1000000, step: 0.01 },
-      pipValue: mintick,
-      pipSize: mintick,
-      minTick: mintick,
-      description: symbol,
+  /**
+   * Get instrument data from cache or database
+   */
+  private async getInstrumentData(symbol: string): Promise<InstrumentCache> {
+    // Check cache first
+    if (this.instrumentCache.has(symbol)) {
+      return this.instrumentCache.get(symbol)!;
+    }
+
+    // Query database
+    const { data, error } = await supabase
+      .from('instruments')
+      .select('id, leverage_default, contract_size')
+      .eq('symbol', symbol)
+      .single();
+
+    if (error || !data) {
+      throw new Error(`Instrument ${symbol} not found`);
+    }
+
+    const result: InstrumentCache = { 
+      id: data.id, 
+      leverage: data.leverage_default || 10,
+      contract_size: data.contract_size || 1
     };
+    
+    this.instrumentCache.set(symbol, result);
+    return result;
   }
 
-  // ============= Orders Methods =============
-
-  async orders(): Promise<TVOrder[]> {
-    return Object.values(this._orderById);
-  }
-
-  async placeOrder(preOrder: any): Promise<any> {
-    console.log('[TradeArenaBroker] Placing order:', preOrder);
-
+  async symbolInfo(symbol: string): Promise<InstrumentInfo> {
     try {
-      const instrumentId = await this.getInstrumentId(preOrder.symbol);
-      const orderType = this.mapOrderType(preOrder.type);
-      
-      // Build order request
-      const orderRequest: Record<string, any> = {
-        competition_id: this.config.competitionId,
-        instrument_id: instrumentId,
-        side: preOrder.side === Side.Buy ? 'buy' : 'sell',
-        quantity: preOrder.qty,
-        leverage: 1,
-        order_type: orderType,
-        create_new_position: true,
+      const { data } = await supabase
+        .from('instruments')
+        .select('*')
+        .eq('symbol', symbol)
+        .single();
+
+      const mintick = data?.min_tick || 0.0001;
+      const contractSize = data?.contract_size || 1;
+
+      return {
+        qty: { min: 0.01, max: 1000000, step: 0.01 },
+        pipSize: mintick,
+        pipValue: mintick * contractSize,
+        minTick: mintick,
+        description: data?.name || symbol,
       };
-      
-      // Only include price for limit/stop orders
-      if (orderType === 'limit' && preOrder.limitPrice) {
-        orderRequest.requested_price = preOrder.limitPrice;
-      } else if (orderType === 'stop' && preOrder.stopPrice) {
-        orderRequest.requested_price = preOrder.stopPrice;
-      }
-      
-      // Include SL/TP if provided
-      if (preOrder.stopLoss) {
-        orderRequest.stop_loss = preOrder.stopLoss;
-      }
-      if (preOrder.takeProfit) {
-        orderRequest.take_profit = preOrder.takeProfit;
-      }
-      
-      console.log('[TradeArenaBroker] Sending order:', orderRequest);
-
-      const { data, error } = await supabase.functions.invoke('place-order', {
-        body: orderRequest,
-      });
-
-      if (error) throw error;
-
-      // Create local order for UI
-      const order = this.createOrder(preOrder);
-      order.status = OrderStatus.Filled;
-      order.price = data?.filled_price || preOrder.limitPrice;
-      this.updateOrder(order);
-
-      // Create position
-      if (data?.position) {
-        this.createPositionFromData(data.position);
-      }
-
-      // Refresh data
-      await this.loadPositions();
-      await this.loadOrders();
-      await this.loadAccountData();
-
-      return { orderId: order.id };
-    } catch (err: any) {
-      console.error('[TradeArenaBroker] Place order error:', err);
-      throw err;
+    } catch (error) {
+      return {
+        qty: { min: 0.01, max: 1000000, step: 0.01 },
+        pipSize: 0.0001,
+        pipValue: 0.0001,
+        minTick: 0.0001,
+        description: symbol,
+      };
     }
   }
 
-  async modifyOrder(order: TVOrder): Promise<void> {
-    console.log('[TradeArenaBroker] Modifying order:', order);
-    
-    const originalOrder = this._orderById[order.id];
-    if (!originalOrder) return;
+  async positions(): Promise<Position[]> {
+    try {
+      const { data, error } = await supabase
+        .from('positions')
+        .select(`
+          id,
+          side,
+          quantity,
+          entry_price,
+          unrealized_pnl,
+          stop_loss,
+          take_profit,
+          status,
+          instrument:instruments!inner(symbol, name)
+        `)
+        .eq('account_id', this.accountId)
+        .eq('status', 'open');
 
-    // Update local order
-    Object.assign(originalOrder, order);
-    this.host.orderUpdate?.(order);
+      if (error) {
+        console.error("[TradeArenaBroker] positions error:", error);
+        return [];
+      }
 
-    // If it's a bracket order, update position brackets in backend
-    if (order.parentId) {
-      await this.updatePositionBrackets(order.parentId, order);
+      return (data || []).map((pos: any) => ({
+        id: pos.id,
+        symbol: pos.instrument?.symbol || 'UNKNOWN',
+        qty: Math.abs(Number(pos.quantity)),
+        side: pos.side === 'buy' ? Side.Buy : Side.Sell,
+        avgPrice: Number(pos.entry_price),
+        pl: Number(pos.unrealized_pnl || 0),
+        stopLoss: pos.stop_loss ? Number(pos.stop_loss) : undefined,
+        takeProfit: pos.take_profit ? Number(pos.take_profit) : undefined,
+      }));
+    } catch (error) {
+      console.error("[TradeArenaBroker] positions error:", error);
+      return [];
+    }
+  }
+
+  async orders(): Promise<Order[]> {
+    try {
+      const { data, error } = await supabase
+        .from('orders')
+        .select(`
+          id,
+          side,
+          quantity,
+          limit_price,
+          stop_price,
+          order_type,
+          status,
+          instrument:instruments!inner(symbol, name)
+        `)
+        .eq('account_id', this.accountId)
+        .in('status', ['pending', 'working', 'placed']);
+
+      if (error) {
+        console.error("[TradeArenaBroker] orders error:", error);
+        return [];
+      }
+
+      return (data || []).map((order: any) => {
+        let orderType = OrderType.Market;
+        if (order.order_type === 'limit') orderType = OrderType.Limit;
+        else if (order.order_type === 'stop') orderType = OrderType.Stop;
+        else if (order.order_type === 'stop_limit') orderType = OrderType.StopLimit;
+
+        return {
+          id: order.id,
+          symbol: order.instrument?.symbol || 'UNKNOWN',
+          type: orderType,
+          side: order.side === 'buy' ? Side.Buy : Side.Sell,
+          qty: Math.abs(Number(order.quantity)),
+          status: order.status === 'pending' ? OrderStatus.Placing : OrderStatus.Working,
+          limitPrice: order.limit_price ? Number(order.limit_price) : undefined,
+          stopPrice: order.stop_price ? Number(order.stop_price) : undefined,
+        };
+      });
+    } catch (error) {
+      console.error("[TradeArenaBroker] orders error:", error);
+      return [];
+    }
+  }
+
+  async placeOrder(preOrder: PreOrder): Promise<{ orderId: string }> {
+    console.log("[TradeArenaBroker] placeOrder:", preOrder);
+
+    try {
+      if (!this.competitionId) {
+        throw new Error("Competition ID is required to place orders");
+      }
+
+      // STEP 1: Resolve symbol to instrument data
+      const instrument = await this.getInstrumentData(preOrder.symbol);
+      console.log("[TradeArenaBroker] Resolved instrument:", instrument);
+
+      // STEP 2: Determine order type
+      let orderType: 'market' | 'limit' | 'stop' | 'stop_limit' = 'market';
+      if (preOrder.type === OrderType.Limit) orderType = 'limit';
+      else if (preOrder.type === OrderType.Stop) orderType = 'stop';
+      else if (preOrder.type === OrderType.StopLimit) orderType = 'stop_limit';
+
+      // STEP 3: Get leverage (use provided or default)
+      const leverage = preOrder.leverage || instrument.leverage || 10;
+
+      // STEP 4: Call place-order with correct parameters
+      const requestBody = {
+        competition_id: this.competitionId,
+        instrument_id: instrument.id,  // ✅ Use UUID instead of symbol
+        side: preOrder.side === Side.Buy ? 'buy' : 'sell',
+        quantity: preOrder.qty,
+        leverage: leverage,
+        stop_loss: preOrder.stopLoss,
+        take_profit: preOrder.takeProfit,
+        order_type: orderType,
+        requested_price: preOrder.limitPrice || preOrder.stopPrice,
+        create_new_position: true
+      };
+
+      console.log("[TradeArenaBroker] Calling place-order with:", requestBody);
+
+      const { data, error } = await supabase.functions.invoke('place-order', {
+        body: requestBody,
+      });
+
+      if (error) throw new Error(error.message);
+      if (data?.error) throw new Error(data.error);
+
+      console.log("[TradeArenaBroker] Order placed:", data);
+
+      toast.success("Order placed successfully");
+      
+      // Trigger updates
+      this.host.orderUpdate?.();
+      this.host.positionUpdate?.();
+
+      return { orderId: data.order_id || 'order_' + Date.now() };
+    } catch (error: any) {
+      console.error("[TradeArenaBroker] placeOrder error:", error);
+      toast.error(error.message || "Failed to place order");
+      throw error;
     }
   }
 
   async cancelOrder(orderId: string): Promise<void> {
-    console.log('[TradeArenaBroker] Canceling order:', orderId);
-    
-    const order = this._orderById[orderId];
-    if (!order) return;
+    console.log("[TradeArenaBroker] cancelOrder:", orderId);
 
-    order.status = OrderStatus.Canceled;
-    this.host.orderUpdate?.(order);
+    try {
+      // Update order status to cancelled in database
+      const { error } = await supabase
+        .from('orders')
+        .update({ status: 'cancelled' })
+        .eq('id', orderId)
+        .eq('account_id', this.accountId);
 
-    // Cancel child brackets too
-    this.getBrackets(orderId).forEach(bracket => this.cancelOrder(bracket.id));
-  }
+      if (error) throw new Error(error.message);
 
-  async cancelOrders(_symbol: string, _side: number | undefined, orderIds: string[]): Promise<void> {
-    await Promise.all(orderIds.map(id => this.cancelOrder(id)));
-  }
-
-  // ============= Position Methods =============
-
-  async positions(): Promise<TVPosition[]> {
-    return this._positionsArray.slice();
-  }
-
-  async individualPositions(): Promise<TVIndividualPosition[]> {
-    return this._positionsArray.map(pos => ({
-      id: pos.id,
-      symbol: pos.symbol,
-      side: pos.side,
-      qty: pos.qty,
-      price: pos.avgPrice,
-      avgPrice: pos.avgPrice,
-      pl: pos.pl || 0,
-      takeProfit: pos.takeProfit,
-      stopLoss: pos.stopLoss,
-    }));
+      toast.success("Order cancelled successfully");
+      this.host.orderUpdate?.();
+    } catch (error: any) {
+      console.error("[TradeArenaBroker] cancelOrder error:", error);
+      toast.error(error.message || "Failed to cancel order");
+      throw error;
+    }
   }
 
   async closePosition(positionId: string): Promise<void> {
-    console.log('[TradeArenaBroker] Closing position:', positionId);
-
-    const position = this._positionById[positionId];
-    if (!position) return;
+    console.log("[TradeArenaBroker] closePosition:", positionId);
 
     try {
-      await supabase.functions.invoke('close-position', {
+      if (!this.competitionId) {
+        throw new Error("Competition ID is required to close positions");
+      }
+
+      const { data, error } = await supabase.functions.invoke('close-position', {
         body: {
-          competition_id: this.config.competitionId,
           position_id: positionId,
+          competition_id: this.competitionId,
         },
       });
 
-      // Remove from local state
-      delete this._positionById[positionId];
-      const idx = this._positionsArray.findIndex(p => p.id === positionId);
-      if (idx >= 0) this._positionsArray.splice(idx, 1);
+      if (error) throw new Error(error.message);
+      if (data?.error) throw new Error(data.error);
 
-      // Cancel associated brackets
-      this.getBrackets(positionId).forEach(bracket => this.cancelOrder(bracket.id));
+      console.log("[TradeArenaBroker] Position closed:", data);
 
-      this.host.positionUpdate?.(position, true); // true = removed
-      await this.loadPositions();
-      await this.loadAccountData();
-    } catch (err) {
-      console.error('[TradeArenaBroker] Close position error:', err);
-      throw err;
+      toast.success("Position closed successfully");
+      this.host.positionUpdate?.();
+    } catch (error: any) {
+      console.error("[TradeArenaBroker] closePosition error:", error);
+      toast.error(error.message || "Failed to close position");
+      throw error;
     }
   }
 
-  async reversePosition(positionId: string): Promise<void> {
-    const position = this._positionById[positionId];
-    if (!position) return;
+  async editPositionBrackets(positionId: string, brackets: Brackets): Promise<void> {
+    console.log("[TradeArenaBroker] editPositionBrackets:", positionId, brackets);
 
-    await this.closePosition(positionId);
-    await this.placeOrder({
-      symbol: position.symbol,
-      side: position.side === Side.Buy ? Side.Sell : Side.Buy,
-      type: OrderType.Market,
-      qty: position.qty,
-    });
-  }
-
-  async editPositionBrackets(positionId: string, brackets: { takeProfit?: number; stopLoss?: number }): Promise<void> {
-    console.log('[TradeArenaBroker] Editing position brackets:', positionId, brackets);
-
-    const position = this._positionById[positionId];
-    if (!position) return;
-
-    // Update position with new brackets
-    position.takeProfit = brackets.takeProfit;
-    position.stopLoss = brackets.stopLoss;
-
-    // Update or create bracket orders
-    const existingBrackets = this.getBrackets(positionId);
-    const tpBracket = existingBrackets.find(b => b.limitPrice !== undefined);
-    const slBracket = existingBrackets.find(b => b.stopPrice !== undefined);
-
-    // Handle Take Profit
-    if (brackets.takeProfit !== undefined) {
-      if (tpBracket) {
-        tpBracket.limitPrice = brackets.takeProfit;
-        this.host.orderUpdate?.(tpBracket);
-      } else {
-        const newTp = this.createTakeProfitBracket(position);
-        newTp.limitPrice = brackets.takeProfit;
-        this.updateOrder(newTp);
-      }
-    } else if (tpBracket) {
-      tpBracket.status = OrderStatus.Canceled;
-      this.host.orderUpdate?.(tpBracket);
-    }
-
-    // Handle Stop Loss
-    if (brackets.stopLoss !== undefined) {
-      if (slBracket) {
-        slBracket.stopPrice = brackets.stopLoss;
-        this.host.orderUpdate?.(slBracket);
-      } else {
-        const newSl = this.createStopLossBracket(position);
-        newSl.stopPrice = brackets.stopLoss;
-        this.updateOrder(newSl);
-      }
-    } else if (slBracket) {
-      slBracket.status = OrderStatus.Canceled;
-      this.host.orderUpdate?.(slBracket);
-    }
-
-    // Update backend
-    await this.updatePositionBracketsInBackend(positionId, brackets);
-
-    this.host.positionUpdate?.(position);
-  }
-
-  // ============= Account Manager =============
-
-  accountManagerInfo(): any {
-    console.log('[TradeArenaBroker] accountManagerInfo called');
-    console.log('[TradeArenaBroker] Current account data:', this._accountManagerData);
-    console.log('[TradeArenaBroker] Watched values:', {
-      balance: this._balanceValue?.value?.(),
-      equity: this._equityValue?.value?.(),
-      pl: this._plValue?.value?.(),
-    });
-    
-    // Use watched values for summary (required by TradingView)
-    // Use string literals for formatters (not enum references)
-    const summaryProps = [
-      {
-        text: 'Balance',
-        wValue: this._balanceValue,
-        formatter: 'fixed',
-        isDefault: true,
-      },
-      {
-        text: 'Equity', 
-        wValue: this._equityValue,
-        formatter: 'fixed',
-        isDefault: true,
-      },
-      {
-        text: 'P&L',
-        wValue: this._plValue,
-        formatter: 'profitInInstrumentCurrency',
-        isDefault: true,
-      },
-    ];
-
-    // FIXED: Using empty pages array - TradingView requires this property to exist
-    // TradingView expects pages property but we provide empty array (no custom pages)
-    const info = {
-      accountTitle: this._accountManagerData.title,
-      summary: summaryProps,
-      orderColumns: this.getOrderColumns(),
-      positionColumns: this.getPositionColumns(),
-      pages: [],
-    };
-    
-    console.log('[TradeArenaBroker] Returning accountManagerInfo:', info);
-    return info;
-  }
-
-  executions(_symbol: string): Promise<any[]> {
-    return Promise.resolve([]);
-  }
-
-  // ============= Private Helper Methods =============
-
-  private async loadAccountData(): Promise<void> {
     try {
-      console.log('[TradeArenaBroker] Loading account data for:', this.config.accountId);
-      
-      const { data, error } = await supabase
-        .from('accounts')
-        .select('*')
-        .eq('id', this.config.accountId)
-        .maybeSingle();
-
-      if (error) {
-        console.error('[TradeArenaBroker] Account query error:', error);
-        return;
-      }
-
-      if (data) {
-        // Update internal data
-        this._accountManagerData.balance = data.balance;
-        this._accountManagerData.equity = data.equity;
-        this._accountManagerData.pl = data.equity - data.balance;
-        
-        console.log('[TradeArenaBroker] Account data loaded:', this._accountManagerData);
-        
-        // Update watched values with setValue
-        if (this._balanceValue?.setValue) {
-          this._balanceValue.setValue(data.balance);
-          console.log('[TradeArenaBroker] Balance value updated to:', data.balance);
-        }
-        if (this._equityValue?.setValue) {
-          this._equityValue.setValue(data.equity);
-          console.log('[TradeArenaBroker] Equity value updated to:', data.equity);
-        }
-        if (this._plValue?.setValue) {
-          this._plValue.setValue(data.equity - data.balance);
-          console.log('[TradeArenaBroker] P&L value updated to:', data.equity - data.balance);
-        }
-        
-        // Verify values were set correctly
-        console.log('[TradeArenaBroker] Verified watched values:', {
-          balance: this._balanceValue?.value?.(),
-          equity: this._equityValue?.value?.(),
-          pl: this._plValue?.value?.(),
-        });
-        
-        // Notify host of account update
-        if (this.host.currentAccountUpdate) {
-          this.host.currentAccountUpdate();
-          console.log('[TradeArenaBroker] Notified host of account update');
-        }
-      } else {
-        console.warn('[TradeArenaBroker] No account found for id:', this.config.accountId);
-      }
-    } catch (err) {
-      console.error('[TradeArenaBroker] Load account error:', err);
-    }
-  }
-
-  private async loadPositions(): Promise<void> {
-    try {
-      console.log('[TradeArenaBroker] Loading positions for account:', this.config.accountId);
-      
-      const { data: positions, error } = await supabase
-        .from('positions')
-        .select('*, instruments(symbol)')
-        .eq('account_id', this.config.accountId)
-        .eq('status', 'open');
-
-      if (error) {
-        console.error('[TradeArenaBroker] Positions query error:', error);
-        return;
-      }
-
-      if (positions) {
-        console.log('[TradeArenaBroker] Loaded', positions.length, 'positions');
-        
-        // Clear existing
-        this._positionsArray.length = 0;
-        Object.keys(this._positionById).forEach(k => delete this._positionById[k]);
-
-        // Add new positions
-        positions.forEach((pos: any) => {
-          const instrument = Array.isArray(pos.instruments) ? pos.instruments[0] : pos.instruments;
-          const tvPos: TVPosition = {
-            id: pos.id,
-            symbol: instrument?.symbol || 'UNKNOWN',
-            side: pos.side === 'buy' ? Side.Buy : Side.Sell,
-            qty: pos.quantity,
-            avgPrice: pos.entry_price,
-            pl: pos.unrealized_pnl,
-            takeProfit: pos.take_profit,
-            stopLoss: pos.stop_loss,
-          };
-          this._positionsArray.push(tvPos);
-          this._positionById[tvPos.id] = tvPos;
-
-          // Create bracket orders for existing SL/TP
-          if (pos.stop_loss) {
-            const slOrder = this.createStopLossBracket(tvPos);
-            slOrder.stopPrice = pos.stop_loss;
-            slOrder.status = OrderStatus.Working;
-            this._orderById[slOrder.id] = slOrder;
-          }
-          if (pos.take_profit) {
-            const tpOrder = this.createTakeProfitBracket(tvPos);
-            tpOrder.limitPrice = pos.take_profit;
-            tpOrder.status = OrderStatus.Working;
-            this._orderById[tpOrder.id] = tpOrder;
-          }
-        });
-
-        // Notify host of full update
-        if (this.host.positionsUpdate) {
-          this.host.positionsUpdate();
-          console.log('[TradeArenaBroker] Notified host of positions update');
-        }
-        if (this.host.ordersFullUpdate) {
-          this.host.ordersFullUpdate();
-          console.log('[TradeArenaBroker] Notified host of orders full update');
-        }
-      }
-    } catch (err) {
-      console.error('[TradeArenaBroker] Load positions error:', err);
-    }
-  }
-
-  private async loadOrders(): Promise<void> {
-    try {
-      console.log('[TradeArenaBroker] Loading orders for account:', this.config.accountId);
-      
-      const { data: orders, error } = await supabase
-        .from('orders')
-        .select('*, instruments(symbol)')
-        .eq('account_id', this.config.accountId)
-        .eq('status', 'pending');
-
-      if (error) {
-        console.error('[TradeArenaBroker] Orders query error:', error);
-        return;
-      }
-
-      if (orders) {
-        console.log('[TradeArenaBroker] Loaded', orders.length, 'orders');
-        
-        orders.forEach((order: any) => {
-          const instrument = Array.isArray(order.instruments) ? order.instruments[0] : order.instruments;
-          const tvOrder: TVOrder = {
-            id: order.id,
-            symbol: instrument?.symbol || 'UNKNOWN',
-            side: order.side === 'buy' ? Side.Buy : Side.Sell,
-            type: this.mapOrderTypeFromDb(order.order_type),
-            qty: order.quantity,
-            status: this.mapOrderStatusFromDb(order.status),
-            limitPrice: order.requested_price,
-            takeProfit: order.take_profit,
-            stopLoss: order.stop_loss,
-          };
-          this._orderById[tvOrder.id] = tvOrder;
-        });
-      }
-    } catch (err) {
-      console.error('[TradeArenaBroker] Load orders error:', err);
-    }
-  }
-
-  private async getInstrumentId(symbol: string): Promise<string> {
-    const { data } = await supabase
-      .from('instruments')
-      .select('id')
-      .eq('symbol', symbol)
-      .single();
-    return data?.id || '';
-  }
-
-  private createOrder(preOrder: any): TVOrder {
-    return {
-      id: `${this.idsCounter++}`,
-      symbol: preOrder.symbol,
-      side: preOrder.side || Side.Buy,
-      type: preOrder.type || OrderType.Market,
-      qty: preOrder.qty,
-      status: OrderStatus.Working,
-      limitPrice: preOrder.limitPrice,
-      stopPrice: preOrder.stopPrice,
-      takeProfit: preOrder.takeProfit,
-      stopLoss: preOrder.stopLoss,
-    };
-  }
-
-  private updateOrder(order: TVOrder): void {
-    this._orderById[order.id] = order;
-    this.host.orderUpdate?.(order);
-  }
-
-  private createPositionFromData(data: any): void {
-    const tvPos: TVPosition = {
-      id: data.id,
-      symbol: data.symbol || 'UNKNOWN',
-      side: data.side === 'buy' ? Side.Buy : Side.Sell,
-      qty: data.quantity,
-      avgPrice: data.entry_price,
-      pl: 0,
-      takeProfit: data.take_profit,
-      stopLoss: data.stop_loss,
-    };
-    this._positionsArray.push(tvPos);
-    this._positionById[tvPos.id] = tvPos;
-    this.host.positionUpdate?.(tvPos);
-  }
-
-  private createTakeProfitBracket(entity: TVPosition | TVOrder): TVOrder {
-    return {
-      id: `${entity.id}_tp`,
-      symbol: entity.symbol,
-      qty: entity.qty,
-      side: entity.side === Side.Buy ? Side.Sell : Side.Buy,
-      type: OrderType.Limit,
-      status: OrderStatus.Working,
-      parentId: entity.id,
-      parentType: ParentType.Position,
-      limitPrice: entity.takeProfit,
-      positionId: entity.id,
-      isClose: true,
-    };
-  }
-
-  private createStopLossBracket(entity: TVPosition | TVOrder): TVOrder {
-    return {
-      id: `${entity.id}_sl`,
-      symbol: entity.symbol,
-      qty: entity.qty,
-      side: entity.side === Side.Buy ? Side.Sell : Side.Buy,
-      type: OrderType.Stop,
-      status: OrderStatus.Working,
-      parentId: entity.id,
-      parentType: ParentType.Position,
-      stopPrice: entity.stopLoss,
-      stopType: StopType.StopLoss,
-      positionId: entity.id,
-      isClose: true,
-    };
-  }
-
-  private getBrackets(parentId: string): TVOrder[] {
-    return Object.values(this._orderById).filter(
-      (order: TVOrder) => order.parentId === parentId &&
-        (order.status === OrderStatus.Inactive || order.status === OrderStatus.Working)
-    );
-  }
-
-  private async updatePositionBrackets(orderId: string, order: TVOrder): Promise<void> {
-    const position = this._positionById[order.parentId || ''];
-    if (!position) return;
-
-    if (order.limitPrice !== undefined) {
-      position.takeProfit = order.limitPrice;
-    }
-    if (order.stopPrice !== undefined) {
-      position.stopLoss = order.stopPrice;
-    }
-
-    await this.updatePositionBracketsInBackend(position.id, {
-      takeProfit: position.takeProfit,
-      stopLoss: position.stopLoss,
-    });
-  }
-
-  private async updatePositionBracketsInBackend(positionId: string, brackets: { takeProfit?: number; stopLoss?: number }): Promise<void> {
-    try {
-      await supabase.functions.invoke('update-position-brackets', {
+      const { data, error } = await supabase.functions.invoke('update-position-brackets', {
         body: {
           position_id: positionId,
           stop_loss: brackets.stopLoss,
           take_profit: brackets.takeProfit,
         },
       });
-    } catch (err) {
-      console.error('[TradeArenaBroker] Update brackets error:', err);
+
+      if (error) throw new Error(error.message);
+      if (data?.error) throw new Error(data.error);
+
+      console.log("[TradeArenaBroker] Brackets updated:", data);
+
+      toast.success("Brackets updated successfully");
+      this.host.positionUpdate?.();
+    } catch (error: any) {
+      console.error("[TradeArenaBroker] editPositionBrackets error:", error);
+      toast.error(error.message || "Failed to update brackets");
+      throw error;
     }
   }
 
-  private mapOrderType(type: number): string {
-    switch (type) {
-      case OrderType.Market: return 'market';
-      case OrderType.Limit: return 'limit';
-      case OrderType.Stop: return 'stop';
-      default: return 'market';
+  accountManagerInfo() {
+    return {
+      accountTitle: "TradeArena",
+      summary: [
+        {
+          text: "Balance",
+          wValue: this.balanceValue,
+          formatter: StandardFormatterName.Fixed,
+          isDefault: true,
+        },
+        {
+          text: "Equity",
+          wValue: this.equityValue,
+          formatter: StandardFormatterName.Fixed,
+          isDefault: true,
+        },
+      ],
+      orderColumns: [
+        {
+          label: "Symbol",
+          formatter: StandardFormatterName.Symbol,
+          id: CommonAccountManagerColumnId.Symbol,
+          dataFields: ["symbol", "symbol"],
+        },
+        {
+          label: "Side",
+          id: "side",
+          dataFields: ["side"],
+          formatter: StandardFormatterName.Side,
+        },
+        {
+          label: "Type",
+          id: "type",
+          dataFields: ["type"],
+          formatter: StandardFormatterName.Type,
+        },
+        {
+          label: "Qty",
+          alignment: "right",
+          id: "qty",
+          dataFields: ["qty"],
+          formatter: StandardFormatterName.FormatQuantity,
+        },
+        {
+          label: "Limit Price",
+          alignment: "right",
+          id: "limitPrice",
+          dataFields: ["limitPrice"],
+          formatter: StandardFormatterName.FormatPrice,
+        },
+        {
+          label: "Status",
+          id: "status",
+          dataFields: ["status"],
+          formatter: StandardFormatterName.Status,
+        },
+      ],
+      positionColumns: [
+        {
+          label: "Symbol",
+          formatter: StandardFormatterName.Symbol,
+          id: CommonAccountManagerColumnId.Symbol,
+          dataFields: ["symbol", "symbol"],
+        },
+        {
+          label: "Side",
+          id: "side",
+          dataFields: ["side"],
+          formatter: StandardFormatterName.Side,
+        },
+        {
+          label: "Qty",
+          alignment: "right",
+          id: "qty",
+          dataFields: ["qty"],
+          formatter: StandardFormatterName.FormatQuantity,
+        },
+        {
+          label: "Avg Price",
+          alignment: "right",
+          id: "avgPrice",
+          dataFields: ["avgPrice"],
+          formatter: StandardFormatterName.FormatPrice,
+        },
+        {
+          label: "Profit",
+          alignment: "right",
+          id: "pl",
+          dataFields: ["pl"],
+          formatter: StandardFormatterName.Profit,
+        },
+        {
+          label: "Stop Loss",
+          alignment: "right",
+          id: "stopLoss",
+          dataFields: ["stopLoss"],
+          formatter: StandardFormatterName.FormatPrice,
+        },
+        {
+          label: "Take Profit",
+          alignment: "right",
+          id: "takeProfit",
+          dataFields: ["takeProfit"],
+          formatter: StandardFormatterName.FormatPrice,
+        },
+      ],
+      pages: [],
+      contextMenuActions: async (_e: MouseEvent, activePageActions: any[]) => {
+        return activePageActions || [];
+      },
+    };
+  }
+
+  async chartContextMenuActions(context: any, options?: any): Promise<any[]> {
+    if (this.host.defaultContextMenuActions) {
+      return this.host.defaultContextMenuActions(context, options);
+    }
+    return [];
+  }
+
+  private async startPolling() {
+    await this.updateAccountData();
+    this.pollingInterval = setInterval(() => {
+      this.updateAccountData();
+    }, 5000);
+  }
+
+  private async updateAccountData() {
+    try {
+      const { data } = await supabase
+        .from('accounts')
+        .select('balance, equity')
+        .eq('id', this.accountId)
+        .single();
+
+      if (data) {
+        this.balanceValue.setValue(Number(data.balance || 0));
+        this.equityValue.setValue(Number(data.equity || 0));
+      }
+    } catch (error) {
+      console.error("[TradeArenaBroker] updateAccountData error:", error);
     }
   }
 
-  private mapOrderTypeFromDb(type: string): number {
-    switch (type) {
-      case 'limit': return OrderType.Limit;
-      case 'stop': return OrderType.Stop;
-      default: return OrderType.Market;
+  destroy() {
+    console.log("[TradeArenaBroker] Destroying");
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
     }
-  }
-
-  private mapOrderStatusFromDb(status: string): number {
-    switch (status) {
-      case 'filled': return OrderStatus.Filled;
-      case 'cancelled': return OrderStatus.Canceled;
-      case 'rejected': return OrderStatus.Rejected;
-      default: return OrderStatus.Working;
-    }
-  }
-
-  // ============= Column Definitions =============
-
-  private getOrderColumns(): any[] {
-    return [
-      { label: 'Symbol', id: 'symbol', dataFields: ['symbol'], formatter: 'symbol', alignment: 'left' },
-      { label: 'Side', id: 'side', dataFields: ['side'], formatter: 'side', alignment: 'left' },
-      { label: 'Type', id: 'type', dataFields: ['type'], formatter: 'orderType', alignment: 'left' },
-      { label: 'Qty', id: 'qty', dataFields: ['qty'], formatter: 'formatQuantity', alignment: 'right' },
-      { label: 'Limit', id: 'limitPrice', dataFields: ['limitPrice'], formatter: 'formatPrice', alignment: 'right' },
-      { label: 'Stop', id: 'stopPrice', dataFields: ['stopPrice'], formatter: 'formatPrice', alignment: 'right' },
-      { label: 'Status', id: 'status', dataFields: ['status'], formatter: 'orderStatus', alignment: 'left' },
-    ];
-  }
-
-  private getPositionColumns(): any[] {
-    return [
-      { label: 'Symbol', id: 'symbol', dataFields: ['symbol'], formatter: 'symbol', alignment: 'left' },
-      { label: 'Side', id: 'side', dataFields: ['side'], formatter: 'positionSide', alignment: 'left' },
-      { label: 'Qty', id: 'qty', dataFields: ['qty'], formatter: 'formatQuantity', alignment: 'right' },
-      { label: 'Avg Price', id: 'avgPrice', dataFields: ['avgPrice', 'price'], formatter: 'formatPrice', alignment: 'right' },
-      { label: 'P&L', id: 'pl', dataFields: ['pl'], formatter: 'profitInInstrumentCurrency', alignment: 'right' },
-      { label: 'SL', id: 'stopLoss', dataFields: ['stopLoss'], formatter: 'formatPrice', alignment: 'right' },
-      { label: 'TP', id: 'takeProfit', dataFields: ['takeProfit'], formatter: 'formatPrice', alignment: 'right' },
-    ];
-  }
-
-  private getAccountSummaryColumns(): any[] {
-    return [
-      { label: 'Title', id: 'title', dataFields: ['title'], alignment: 'left', formatter: 'fixed' },
-      { label: 'Balance', id: 'balance', dataFields: ['balance'], alignment: 'right', formatter: 'fixed' },
-      { label: 'Equity', id: 'equity', dataFields: ['equity'], alignment: 'right', formatter: 'fixed' },
-      { label: 'P&L', id: 'pl', dataFields: ['pl'], alignment: 'right', formatter: 'fixed' },
-    ];
+    this.instrumentCache.clear();
   }
 }
 
-// ============= Broker Factory =============
-
-export function createTradeArenaBrokerFactory(config: BrokerConfig) {
-  console.log('[createTradeArenaBrokerFactory] Creating factory with config:', config);
-  return function(host: any) {
-    console.log('[BrokerFactory] Instantiating broker with host:', {
-      hasFactory: !!host?.factory,
-      hasCreateWatchedValue: !!host?.factory?.createWatchedValue,
-    });
-    return new TradeArenaBroker(host, config);
-  };
+export function createTradeArenaBroker(
+  host: any,
+  config: {
+    accountId: string;
+    userId: string;
+    competitionId?: string;
+  }
+): TradeArenaBroker {
+  return new TradeArenaBroker(host, config);
 }
-
-export default TradeArenaBroker;
 
