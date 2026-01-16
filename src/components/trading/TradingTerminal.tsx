@@ -1,6 +1,6 @@
 /**
- * TradingView Trading Terminal - Clean Implementation
- * Based on trading_platform-master/trading.html and broker-api.d.ts
+ * TradingView Trading Terminal
+ * Based on trading_platform-master/trading.html configuration
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -78,7 +78,7 @@ export function TradingTerminal({
     }
 
     if (widgetRef.current) {
-      return; // Already initialized
+      return;
     }
 
     console.log("[TradingTerminal] Initializing...");
@@ -86,7 +86,7 @@ export function TradingTerminal({
     try {
       const datafeed = createDatafeed();
 
-      // Broker factory function - called by TradingView
+      // Broker factory - called by TradingView
       const brokerFactory = (host: any) => {
         console.log("[TradingTerminal] Creating broker with host");
         
@@ -105,68 +105,35 @@ export function TradingTerminal({
       };
 
       /**
-       * Broker Configuration Flags (from broker-api.d.ts BrokerConfigFlags)
+       * Broker config - EXACTLY matching trading_platform-master/trading.html
        * 
-       * CRITICAL FLAGS FOR EDIT BUTTON AND SL/TP DRAGGING:
-       * - supportPositionBrackets: true  -> Enables Edit button and bracket editing
+       * CRITICAL FLAGS:
+       * - supportPositionBrackets: true  -> Enables Edit button and bracket dialog
        * - supportOrderBrackets: true     -> Enables SL/TP for orders
-       * - supportModifyBrackets: true    -> Allows modifying existing brackets
-       * 
-       * The broker's positionActions() method must return ['editPosition', 'editStopLoss', 'editTakeProfit']
-       * for the dragging to work properly.
+       * - supportMarketBrackets: true    -> Enables SL/TP for market orders
        */
       const brokerConfig = {
         configFlags: {
-          // Position support
-          supportPositions: true,
-          supportPositionBrackets: true,          // ✅ CRITICAL - Enables Edit button for positions
-          supportClosePosition: true,             // ✅ Enables close position functionality
-          supportPartialClosePosition: false,     // Partial close disabled
-          
-          // Position reversal
-          supportReversePosition: true,           // ✅ Enables reverse button
-          supportNativeReversePosition: true,     // Use our reversePosition method
-          
-          // Order support
-          supportMarketOrders: true,
-          supportLimitOrders: true,
-          supportStopOrders: true,
-          supportStopLimitOrders: false,
-          
-          // Bracket support
-          supportOrderBrackets: true,             // ✅ SL/TP for orders
-          supportMarketBrackets: true,            // ✅ SL/TP for market orders
-          supportModifyBrackets: true,            // ✅ CRITICAL - Allows modifying brackets
-          supportAddBracketsToExistingOrder: true,
-          
-          // P&L
-          supportPLUpdate: true,                  // We provide P&L updates
-          
-          // Order editing
-          supportEditAmount: false,               // Cannot change quantity after order
-          supportModifyOrderPrice: true,          // Can modify limit/stop prices
-          
-          // Display
-          showQuantityInsteadOfAmount: true,
-          
-          // Features we don't support
+          // From trading_platform-master exactly:
+          supportNativeReversePosition: true,
+          supportClosePosition: true,
+          supportPLUpdate: true,
           supportLevel2Data: false,
+          showQuantityInsteadOfAmount: true,
+          supportEditAmount: false,
+          supportOrderBrackets: true,
+          supportMarketBrackets: true,
+          supportPositionBrackets: true,  // ✅ CRITICAL - enables Edit button
           supportOrdersHistory: false,
-          supportMultiposition: true,             // Multiple positions per symbol
-          supportPositionNetting: false,
-          supportIndividualPositionBrackets: false,
-          supportLeverage: false,
-          supportLeverageButton: false,
         },
         durations: [
-          { name: "DAY", value: "DAY", default: true },
-          { name: "GTC", value: "GTC" },
+          { name: 'DAY', value: 'DAY' },
+          { name: 'GTC', value: 'GTC' },
         ],
       };
 
       // Widget configuration
       const widgetConfig = {
-        // Core settings
         fullscreen: true,
         symbol: symbol,
         interval: "1D",
@@ -177,27 +144,22 @@ export function TradingTerminal({
         timezone: "Etc/UTC",
         theme: "dark",
 
-        // Disabled features
         disabled_features: [
           "use_localstorage_for_settings",
           "header_compare",
         ],
 
-        // Enabled features
         enabled_features: [
           "study_templates",
           "dom_widget",
           "side_toolbar_in_fullscreen_mode",
-          "show_trading_notifications_history",
         ],
 
-        // Storage
         charts_storage_url: "https://saveload.tradingview.com",
         charts_storage_api_version: "1.1",
         client_id: "tradearena_platform",
         user_id: user.id,
 
-        // Widgetbar
         widgetbar: {
           details: true,
           news: false,
@@ -213,10 +175,7 @@ export function TradingTerminal({
         broker_config: brokerConfig,
       };
 
-      console.log("[TradingTerminal] Creating widget with config:", {
-        symbol,
-        brokerConfigFlags: brokerConfig.configFlags
-      });
+      console.log("[TradingTerminal] Creating widget with broker_config:", brokerConfig);
       
       widgetRef.current = new window.TradingView.widget(widgetConfig);
       window.tvWidget = widgetRef.current;
@@ -224,12 +183,6 @@ export function TradingTerminal({
       widgetRef.current.onChartReady(() => {
         console.log("[TradingTerminal] Chart ready");
         setIsReady(true);
-        
-        // Enable trading on the chart
-        if (widgetRef.current.activeChart) {
-          const chart = widgetRef.current.activeChart();
-          console.log("[TradingTerminal] Active chart ready");
-        }
       });
 
     } catch (err: any) {
@@ -251,7 +204,6 @@ export function TradingTerminal({
 
   return (
     <div style={{ width: "100%", height: "100%", position: "relative", backgroundColor: "#131722" }}>
-      {/* Container for TradingView */}
       <div
         ref={containerRef}
         style={{
@@ -263,7 +215,6 @@ export function TradingTerminal({
         }}
       />
 
-      {/* Loading overlay */}
       {!isReady && !error && (
         <div
           style={{
@@ -296,7 +247,6 @@ export function TradingTerminal({
         </div>
       )}
 
-      {/* Error overlay */}
       {error && (
         <div
           style={{
@@ -321,7 +271,6 @@ export function TradingTerminal({
         </div>
       )}
 
-      {/* CSS for spinner animation */}
       <style>{`
         @keyframes spin {
           0% { transform: rotate(0deg); }
