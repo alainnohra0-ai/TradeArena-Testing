@@ -105,26 +105,36 @@ export function TradingTerminal({
       };
 
       /**
-       * Broker config - EXACTLY matching trading_platform-master/trading.html
+       * Broker config - Based on TradingView broker-sample
        * 
        * CRITICAL FLAGS:
-       * - supportPositionBrackets: true  -> Enables Edit button and bracket dialog
-       * - supportOrderBrackets: true     -> Enables SL/TP for orders
-       * - supportMarketBrackets: true    -> Enables SL/TP for market orders
+       * - supportPositionBrackets: true      -> Enables Edit button and bracket dialog
+       * - supportOrderBrackets: true         -> Enables SL/TP for orders
+       * - supportMarketBrackets: true        -> Enables SL/TP for market orders
+       * - supportMultiAccountSwitch: true    -> Enables account switcher dropdown
+       * - calculatePLForBracketOrder: true   -> Shows P&L preview when dragging SL/TP
        */
       const brokerConfig = {
         configFlags: {
-          // From trading_platform-master exactly:
+          // Position & Order management
           supportNativeReversePosition: true,
           supportClosePosition: true,
           supportPLUpdate: true,
           supportLevel2Data: false,
           showQuantityInsteadOfAmount: true,
           supportEditAmount: false,
+          supportOrdersHistory: false,
+          
+          // Bracket orders (SL/TP)
           supportOrderBrackets: true,
           supportMarketBrackets: true,
-          supportPositionBrackets: true,  // ✅ CRITICAL - enables Edit button
-          supportOrdersHistory: false,
+          supportPositionBrackets: true,  // ✅ Enables Edit button
+          
+          // P&L preview for brackets - Shows P&L when dragging SL/TP lines
+          calculatePLForBracketOrder: true,
+          
+          // Multiple accounts support - Enables account dropdown in Account Manager
+          supportMultiAccountSwitch: true,
         },
         durations: [
           { name: 'DAY', value: 'DAY' },

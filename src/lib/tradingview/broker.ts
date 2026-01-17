@@ -1,5 +1,13 @@
 /**
  * TradeArena Broker Implementation - Based on TradingView broker-sample
+ * 
+ * Features:
+ * - Position management (open, close, reverse)
+ * - Bracket editing (SL/TP) with drag support
+ * - Real-time P&L calculation with contract size
+ * - Account Manager integration
+ * - Multiple accounts support (for competitions)
+ * - P&L preview for SL/TP brackets
  */
 
 import { supabase } from "@/integrations/supabase/client";
@@ -55,6 +63,7 @@ export const CommonAccountManagerColumnId = {
   Symbol: "symbol",
 };
 
+// Extended Position interface with contract size for P&L
 export interface Position {
   id: string;
   symbol: string;
@@ -66,6 +75,7 @@ export interface Position {
   price?: number;
   stopLoss?: number;
   takeProfit?: number;
+  contractSize?: number;
 }
 
 export interface Order {
@@ -118,6 +128,15 @@ interface InstrumentCache {
   contract_size: number;
 }
 
+// Account info for multiple account support
+interface AccountInfo {
+  id: string;
+  name: string;
+  currency: string;
+  balance?: number;
+  competitionName?: string;
+}
+
 function changeSide(side: Side): Side {
   return side === Side.Buy ? Side.Sell : Side.Buy;
 }
@@ -139,6 +158,10 @@ export class TradeArenaBroker {
   private _positionById: Map<string, Position> = new Map();
   private _orderById: Map<string, Order> = new Map();
   private _initialDataLoaded: boolean = false;
+  
+  // Multiple accounts support
+  private _accounts: AccountInfo[] = [];
+  private _accountsLoaded: boolean = false;
 
   constructor(
     host: any,
@@ -156,7 +179,10 @@ export class TradeArenaBroker {
     this._balanceValue = this._host.factory.createWatchedValue(0);
     this._equityValue = this._host.factory.createWatchedValue(0);
 
-    this._loadInitialDataAndNotify();
+    // Load accounts first, then initial data
+    this._loadUserAccounts().then(() => {
+      this._loadInitialDataAndNotify();
+    });
     this._startPolling();
     
     console.log("[TradeArenaBroker] Initialized", config);
@@ -170,12 +196,136 @@ export class TradeArenaBroker {
     return this._accountId;
   }
 
+  /**
+   * Load all competition accounts for this user
+   * This enables the account switcher in TradingView's Account Manager
+   */
+  private async _loadUserAccounts(): Promise<void> {
+    try {
+      console.log("[TradeArenaBroker] Loading user accounts for userId:", this._userId);
+      
+      // Query competition_participants to get all accounts for this user
+      const { data, error } = await supabase
+        .from('competition_participants')
+        .select(`
+          account_id,
+          competition:competitions!inner(id, name),
+          account:accounts!inner(id, balance, equity)
+        `)
+        .eq('user_id', this._userId);
+
+      if (error) {
+        console.error("[TradeArenaBroker] Failed to load user accounts:", error);
+        // Fallback to single account
+        this._accounts = [{
+          id: this._accountId,
+          name: 'TradeArena Trading Account',
+          currency: 'USD',
+        }];
+        return;
+      }
+
+      if (!data || data.length === 0) {
+        console.log("[TradeArenaBroker] No competition accounts found, using default");
+        this._accounts = [{
+          id: this._accountId,
+          name: 'TradeArena Trading Account',
+          currency: 'USD',
+        }];
+        return;
+      }
+
+      // Map to AccountInfo format
+      this._accounts = data.map((row: any) => ({
+        id: row.account_id,
+        name: row.competition?.name || 'Trading Account',
+        currency: 'USD',
+        balance: row.account?.balance,
+        competitionName: row.competition?.name,
+      }));
+
+      console.log("[TradeArenaBroker] ✅ Loaded", this._accounts.length, "accounts:", this._accounts);
+      this._accountsLoaded = true;
+
+    } catch (error) {
+      console.error("[TradeArenaBroker] _loadUserAccounts error:", error);
+      this._accounts = [{
+        id: this._accountId,
+        name: 'TradeArena Trading Account',
+        currency: 'USD',
+      }];
+    }
+  }
+
+  /**
+   * Returns list of accounts for TradingView's account switcher dropdown
+   */
   async accountsMetainfo(): Promise<any[]> {
-    return [{
-      id: this._accountId,
-      name: 'TradeArena Trading Account',
-      currency: 'USD',
-    }];
+    // Wait for accounts to load if not ready
+    if (!this._accountsLoaded && this._accounts.length === 0) {
+      await this._loadUserAccounts();
+    }
+
+    // Return accounts in TradingView's expected format
+    return this._accounts.map(acc => ({
+      id: acc.id,
+      name: acc.competitionName ? `${acc.competitionName}` : acc.name,
+      currency: acc.currency,
+    }));
+  }
+
+  /**
+   * Called by TradingView when user switches accounts in the dropdown
+   */
+  async setCurrentAccount(accountId: string): Promise<void> {
+    console.log("[TradeArenaBroker] 🔄 Switching to account:", accountId);
+    
+    if (accountId === this._accountId) {
+      console.log("[TradeArenaBroker] Already on this account");
+      return;
+    }
+
+    // Find the account to get its competition ID
+    const account = this._accounts.find(a => a.id === accountId);
+    if (!account) {
+      console.error("[TradeArenaBroker] Account not found:", accountId);
+      throw new Error("Account not found");
+    }
+
+    // Update current account
+    this._accountId = accountId;
+    
+    // Clear caches
+    this._positions = [];
+    this._positionById.clear();
+    this._orderById.clear();
+
+    // Find competition ID for this account
+    try {
+      const { data } = await supabase
+        .from('competition_participants')
+        .select('competition_id')
+        .eq('account_id', accountId)
+        .eq('user_id', this._userId)
+        .single();
+      
+      if (data) {
+        this._competitionId = data.competition_id;
+        console.log("[TradeArenaBroker] Updated competition ID:", this._competitionId);
+      }
+    } catch (error) {
+      console.error("[TradeArenaBroker] Failed to get competition ID:", error);
+    }
+
+    // Reload all data for new account
+    await this._loadInitialDataAndNotify();
+    await this._updateAccountData();
+
+    // Notify TradingView of account switch
+    this._host.currentAccountUpdate?.();
+    
+    toast.success(`Switched to ${account.name}`);
+    console.log("[TradeArenaBroker] ✅ Account switch complete");
   }
 
   async isTradable(_symbol: string): Promise<boolean> {
@@ -185,22 +335,95 @@ export class TradeArenaBroker {
   async symbolInfo(symbol: string): Promise<InstrumentInfo> {
     try {
       const mintick = await this._host.getSymbolMinTick(symbol);
+      const pipSize = mintick || 0.0001;
+      
+      // Get contract size for proper pipValue calculation
+      // pipValue = pipSize * contractSize (e.g., 0.0001 * 100000 = $10 per pip for forex)
+      let contractSize = 100000; // Default for forex
+      try {
+        const instrument = await this._getInstrumentData(symbol);
+        contractSize = instrument.contract_size || 100000;
+      } catch {
+        // Default contract sizes based on symbol type
+        if (['XAUUSD', 'XAGUSD'].includes(symbol)) {
+          contractSize = 100; // Metals
+        } else if (symbol.includes('BTC') || symbol.includes('ETH')) {
+          contractSize = 1; // Crypto
+        } else if (symbol.length === 6) {
+          contractSize = 100000; // Forex pairs
+        }
+      }
+      
+      const pipValue = pipSize * contractSize;
+      
       return {
-        qty: { min: 0.01, max: 1000000, step: 0.01, default: 0.1 },
-        pipSize: mintick || 0.0001,
-        pipValue: mintick || 0.0001,
-        minTick: mintick || 0.0001,
+        qty: { min: 0.01, max: 1000, step: 0.01, default: 0.1 },
+        pipSize: pipSize,
+        pipValue: pipValue,
+        minTick: pipSize,
         description: symbol,
       };
     } catch (error) {
+      // Fallback with forex defaults
       return {
-        qty: { min: 0.01, max: 1000000, step: 0.01, default: 0.1 },
+        qty: { min: 0.01, max: 1000, step: 0.01, default: 0.1 },
         pipSize: 0.0001,
-        pipValue: 0.0001,
+        pipValue: 10, // Default for forex: 0.0001 * 100000
         minTick: 0.0001,
         description: symbol,
       };
     }
+  }
+
+  /**
+   * Calculate P&L for bracket order preview (SL/TP lines on chart)
+   * Called by TradingView when user drags SL/TP lines to show potential P&L
+   */
+  async calculatePLForBracketOrder(
+    positionId: string,
+    brackets: Brackets
+  ): Promise<{ pl: number; plPercent: number }> {
+    const position = this._positionById.get(positionId);
+    
+    if (!position) {
+      return { pl: 0, plPercent: 0 };
+    }
+
+    // Get contract size for P&L calculation
+    let contractSize = position.contractSize || 100000;
+    try {
+      const instrument = await this._getInstrumentData(position.symbol);
+      contractSize = instrument.contract_size || 100000;
+    } catch {
+      // Use default
+    }
+
+    // Calculate P&L for the bracket level (SL or TP)
+    const bracketPrice = brackets.stopLoss || brackets.takeProfit || position.avgPrice;
+    const priceDiff = position.side === Side.Buy 
+      ? bracketPrice - position.avgPrice 
+      : position.avgPrice - bracketPrice;
+    
+    // P&L = priceDiff × qty × contractSize
+    const pl = priceDiff * position.qty * contractSize;
+    
+    // Calculate percentage based on position value
+    const positionValue = position.avgPrice * position.qty * contractSize;
+    const plPercent = positionValue > 0 ? (pl / positionValue) * 100 : 0;
+
+    console.log("[TradeArenaBroker] calculatePLForBracketOrder:", {
+      positionId,
+      brackets,
+      avgPrice: position.avgPrice,
+      bracketPrice,
+      priceDiff,
+      qty: position.qty,
+      contractSize,
+      pl,
+      plPercent,
+    });
+
+    return { pl, plPercent };
   }
 
   private async _loadInitialDataAndNotify(): Promise<void> {
@@ -229,7 +452,7 @@ export class TradeArenaBroker {
           stop_loss,
           take_profit,
           status,
-          instrument:instruments!inner(symbol, name)
+          instrument:instruments!inner(symbol, name, contract_size)
         `)
         .eq('account_id', this._accountId)
         .eq('status', 'open');
@@ -244,6 +467,17 @@ export class TradeArenaBroker {
 
       for (const pos of (data || [])) {
         const avgPrice = Number(pos.entry_price);
+        const currentPrice = pos.current_price ? Number(pos.current_price) : avgPrice;
+        const contractSize = pos.instrument?.contract_size || 100000;
+        
+        // Calculate P&L using contract size
+        // P&L = (currentPrice - avgPrice) × qty × contractSize for BUY
+        // P&L = (avgPrice - currentPrice) × qty × contractSize for SELL
+        const priceDiff = pos.side === 'buy' 
+          ? currentPrice - avgPrice 
+          : avgPrice - currentPrice;
+        const calculatedPl = priceDiff * Math.abs(Number(pos.quantity)) * contractSize;
+        
         const position: Position = {
           id: pos.id,
           symbol: pos.instrument?.symbol || 'UNKNOWN',
@@ -251,10 +485,12 @@ export class TradeArenaBroker {
           side: pos.side === 'buy' ? Side.Buy : Side.Sell,
           avgPrice: avgPrice,
           price: avgPrice,
-          pl: Number(pos.unrealized_pnl || 0),
-          last: pos.current_price ? Number(pos.current_price) : avgPrice,
+          // Use calculated P&L if unrealized_pnl is 0 or null
+          pl: Number(pos.unrealized_pnl) || calculatedPl,
+          last: currentPrice,
           stopLoss: pos.stop_loss ? Number(pos.stop_loss) : undefined,
           takeProfit: pos.take_profit ? Number(pos.take_profit) : undefined,
+          contractSize: contractSize,
         };
 
         this._positions.push(position);
@@ -353,7 +589,7 @@ export class TradeArenaBroker {
     const result: InstrumentCache = { 
       id: data.id, 
       leverage: data.leverage_default || 10,
-      contract_size: data.contract_size || 1
+      contract_size: data.contract_size || 100000
     };
     
     this._instrumentCache.set(symbol, result);
@@ -520,7 +756,6 @@ export class TradeArenaBroker {
 
       console.log("[TradeArenaBroker] Calling close-position edge function...");
 
-      // Use supabase.functions.invoke which handles auth automatically
       const { data, error } = await supabase.functions.invoke('close-position', {
         body: {
           position_id: positionId,
@@ -543,7 +778,6 @@ export class TradeArenaBroker {
       console.log("[TradeArenaBroker] ✅ Position closed successfully:", data);
       toast.success("Position closed successfully");
 
-      // Update local state
       position.qty = 0;
       this._host.positionUpdate(position);
       
@@ -773,15 +1007,62 @@ export class TradeArenaBroker {
   }
 
   private async _updatePositionPrices(): Promise<void> {
-    for (const position of this._positions) {
-      if (position.last) {
-        const priceDiff = position.side === Side.Buy 
-          ? position.last - position.avgPrice 
-          : position.avgPrice - position.last;
-        position.pl = priceDiff * position.qty;
-        
-        this._host.plUpdate?.(position.symbol, position.pl);
-        this._host.positionPartialUpdate?.(position.id, { pl: position.pl });
+    // Fetch latest prices from market_prices_latest
+    try {
+      const symbols = this._positions.map(p => p.symbol);
+      if (symbols.length === 0) return;
+
+      const { data: prices } = await supabase
+        .from('market_prices_latest')
+        .select('symbol, bid, ask')
+        .in('symbol', symbols);
+
+      if (!prices) return;
+
+      const priceMap = new Map(prices.map(p => [p.symbol, p]));
+
+      for (const position of this._positions) {
+        const priceData = priceMap.get(position.symbol);
+        if (priceData) {
+          // Use bid for SELL positions (closing a sell = buying at bid)
+          // Use ask for BUY positions (closing a buy = selling at ask)
+          // Actually for P&L: BUY profits when price goes up (use bid for mark-to-market)
+          // SELL profits when price goes down (use ask for mark-to-market)
+          const currentPrice = position.side === Side.Buy 
+            ? Number(priceData.bid) 
+            : Number(priceData.ask);
+          
+          if (currentPrice > 0) {
+            position.last = currentPrice;
+            
+            const contractSize = position.contractSize || 100000;
+            const priceDiff = position.side === Side.Buy 
+              ? currentPrice - position.avgPrice 
+              : position.avgPrice - currentPrice;
+            
+            position.pl = priceDiff * position.qty * contractSize;
+            
+            this._host.plUpdate?.(position.symbol, position.pl);
+            this._host.positionPartialUpdate?.(position.id, { 
+              pl: position.pl,
+              last: position.last 
+            });
+          }
+        }
+      }
+    } catch (error) {
+      // Fallback to simple calculation if no prices available
+      for (const position of this._positions) {
+        if (position.last && position.last !== position.avgPrice) {
+          const contractSize = position.contractSize || 100000;
+          const priceDiff = position.side === Side.Buy 
+            ? position.last - position.avgPrice 
+            : position.avgPrice - position.last;
+          position.pl = priceDiff * position.qty * contractSize;
+          
+          this._host.plUpdate?.(position.symbol, position.pl);
+          this._host.positionPartialUpdate?.(position.id, { pl: position.pl });
+        }
       }
     }
   }
@@ -796,6 +1077,7 @@ export class TradeArenaBroker {
     this._positionById.clear();
     this._orderById.clear();
     this._positions = [];
+    this._accounts = [];
   }
 }
 

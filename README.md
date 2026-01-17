@@ -1,361 +1,254 @@
-# 🚀 TradeArena - COMPLETE SETUP INSTRUCTIONS
+# TradeArena - Trading Competition Platform
 
-## Current Status: ✅ Everything Ready!
+A comprehensive cryptocurrency/stock trading competition platform built with React, TypeScript, Supabase, and TradingView's Charting Library.
 
-Your trading backend is fully built and ready to use. You just need to **seed the database with market data**.
+## 🏗️ Architecture
 
----
+### Tech Stack
+- **Frontend**: React 18 + TypeScript + Vite
+- **Styling**: Tailwind CSS + shadcn/ui components
+- **Backend**: Supabase (PostgreSQL + Edge Functions + Realtime)
+- **Charts**: TradingView Charting Library (Advanced Charts)
+- **Price Data**: Twelve Data API
 
-## 🎯 Quick Fix (5 Minutes)
+### Database Schema (18 Tables)
+- `competitions` - Competition definitions
+- `competition_rules` - Trading rules per competition
+- `competition_instruments` - Allowed instruments per competition
+- `competition_participants` - User participation records
+- `accounts` - Trading accounts (one per competition per user)
+- `positions` - Open/closed trading positions
+- `orders` - Order records
+- `trades` - Closed trade history
+- `equity_snapshots` - Historical equity tracking
+- `rank_snapshots` - Competition ranking history
+- `disqualifications` - DQ records
+- `instruments` - Trading instruments (forex, crypto, indices, commodities)
+- `market_prices_latest` - Current prices
+- `market_candles` - Historical OHLCV data
+- `wallet_accounts` - User wallets
+- `wallet_transactions` - Wallet transaction history
+- `withdraw_requests` - Withdrawal requests
+- `profiles` - User profiles
+- `user_roles` - Role assignments
 
-### Step 1: Copy the SQL
+### Edge Functions (9 Functions)
+1. **place-order** - Execute market/limit/stop orders
+2. **close-position** - Close positions with P&L calculation
+3. **update-position-brackets** - Update SL/TP levels
+4. **join-competition** - Join competition and create account
+5. **price-engine** - Centralized price fetching from Twelve Data
+6. **candles-engine** - Historical candle data
+7. **get-forex-price** - Legacy price function
+8. **sltp-trigger-engine** - Background SL/TP trigger checker
+9. **pnl-update-engine** - Background P&L updater
 
-The SQL file is ready at: `seed-market-data.sql`
+## 🚀 Features
 
-Or copy it from below:
+### Trading Features
+- ✅ Open positions (market orders)
+- ✅ Close positions
+- ✅ Reverse positions
+- ✅ Set/modify Stop Loss (SL)
+- ✅ Set/modify Take Profit (TP)
+- ✅ Drag SL/TP lines on chart
+- ✅ Real-time P&L calculation
+- ✅ Account Manager panel (positions, orders)
+- ✅ Multiple competition accounts support
 
-```sql
--- Copy everything from seed-market-data.sql
-```
+### Competition Features
+- ✅ Join competitions
+- ✅ Entry fee deduction from wallet
+- ✅ Starting balance per competition
+- ✅ Max drawdown enforcement
+- ✅ Max leverage limits
+- ✅ Max position size limits
+- ✅ Automatic disqualification on rule breach
+- ✅ Leaderboard ranking
 
-### Step 2: Run in Supabase Dashboard
-
-1. **Open Supabase**: https://supabase.com/dashboard/project/tevkmkadkgwgdutbjztu/editor
-2. **Click "SQL Editor"** (left menu)
-3. **Click "New Query"**
-4. **Paste the SQL** from `seed-market-data.sql`
-5. **Click "Run"** (or press Ctrl+Enter)
-
-### Step 3: Verify Output
-
-You should see:
-```
-Prices loaded: 23
-Daily candles loaded: 690  
-Hourly candles loaded: 3887
-```
-
-### Step 4: Test Your Platform
-
-1. **Start dev server**:
-   ```bash
-   npm run dev
-   ```
-
-2. **Open browser**: http://localhost:5173/trading?symbol=EURUSD
-
-3. **Chart should display!** ✅
-
-4. **Test order**:
-   - Click "Trade" button
-   - Select BUY
-   - Quantity: 0.1
-   - Leverage: 10x
-   - Click "Place Order"
-
-5. **Verify**:
-   - ✅ Success toast appears
-   - ✅ Position shows in panel
-   - ✅ P&L updates
-
----
+### Price & Data
+- ✅ Real-time prices from Twelve Data API
+- ✅ Bid/Ask spread calculation
+- ✅ Price caching with TTL
+- ✅ Fallback to database prices
+- ✅ Historical candle data
+- ✅ Realtime price updates via Supabase
 
 ## 📁 Project Structure
 
 ```
-/home/kali/projects/supabase-deploy-hub/
-├── seed-market-data.sql          # ⭐ Run this SQL
-├── QUICK_FIX.md                  # Quick reference
-├── README.md                     # This file
-├── generate-seed-sql.sh          # Script that generated the SQL
-│
-├── docs/
-│   ├── COMPLETE_FIX_GUIDE.md                    # Full guide (20 pages)
-│   ├── TRADING_BACKEND_COMPREHENSIVE_REVIEW.md  # Backend docs
-│   ├── TRADING_WORKFLOW_COMPLETE.md             # Trading flow
-│   └── FIX_CHART_NO_DATA.md                    # Troubleshooting
-│
-├── supabase/
-│   ├── functions/                # 7 Edge Functions
-│   │   ├── place-order/
-│   │   ├── close-position/
-│   │   ├── update-position-brackets/
-│   │   ├── price-engine/
-│   │   ├── candles-engine/
-│   │   ├── join-competition/
-│   │   └── get-forex-price/
-│   │
-│   └── migrations/               # Database schema
-│       └── 20260116_seed_market_data.sql
-│
-└── src/
-    ├── lib/tradingview/
-    │   ├── broker.ts            # TradingView broker
-    │   └── datafeed.ts          # Chart datafeed
-    │
-    ├── components/trading/
-    │   └── TradingTerminal.tsx  # Trading UI
-    │
-    └── pages/
-        └── Trading.tsx          # Trading page
+supabase-deploy-hub/
+├── public/
+│   └── charting_library/     # TradingView library files
+├── src/
+│   ├── components/
+│   │   ├── trading/
+│   │   │   └── TradingTerminal.tsx   # TradingView widget wrapper
+│   │   ├── ui/                        # shadcn/ui components
+│   │   └── admin/                     # Admin components
+│   ├── contexts/
+│   │   └── AuthContext.tsx           # Authentication context
+│   ├── hooks/
+│   │   ├── useCompetitions.ts        # Competition data hooks
+│   │   ├── useRealtimePrices.ts      # Realtime price subscription
+│   │   └── useTrading.ts             # Trading hooks
+│   ├── lib/
+│   │   ├── tradingview/
+│   │   │   └── broker.ts             # TradingView Broker API implementation
+│   │   └── tradingviewDatafeed.ts    # TradingView Datafeed implementation
+│   ├── pages/
+│   │   ├── Trading.tsx               # Main trading page
+│   │   ├── Competitions.tsx          # Competition browser
+│   │   └── MyCompetitionDashboard.tsx # Competition dashboard
+│   └── integrations/
+│       └── supabase/
+│           ├── client.ts             # Supabase client
+│           └── types.ts              # Auto-generated types
+└── supabase/
+    ├── functions/
+    │   ├── place-order/
+    │   ├── close-position/
+    │   ├── update-position-brackets/
+    │   ├── join-competition/
+    │   ├── price-engine/
+    │   ├── candles-engine/
+    │   ├── sltp-trigger-engine/
+    │   └── pnl-update-engine/
+    └── migrations/                   # Database migrations
 ```
 
----
+## 🔧 Configuration
 
-## 🔧 Your Backend Architecture
+### Environment Variables
 
-### ✅ What's Already Built
-
-1. **18 Database Tables**
-   - instruments (23 active)
-   - market_prices_latest
-   - market_candles
-   - competitions, participants, accounts
-   - positions, orders, trades
-   - equity_snapshots, rank_snapshots
-   - wallets, transactions
-
-2. **7 Edge Functions**
-   - ✅ place-order - Execute trades
-   - ✅ close-position - Close positions
-   - ✅ update-position-brackets - Modify SL/TP
-   - ✅ price-engine - Fetch real-time prices
-   - ✅ candles-engine - Historical data
-   - ✅ join-competition - Competition enrollment
-   - ✅ get-forex-price - Legacy price fetcher
-
-3. **TradingView Integration**
-   - ✅ Custom broker implementation
-   - ✅ Real-time datafeed
-   - ✅ Account Manager widget
-   - ✅ Position management
-   - ✅ Order execution
-   - ✅ Bracket orders (SL/TP)
-
-4. **Risk Management**
-   - ✅ Margin calculations
-   - ✅ Drawdown monitoring
-   - ✅ Auto-disqualification
-   - ✅ Position size limits
-   - ✅ Leverage limits
-
-### ⚠️ What's Missing
-
-**ONLY** market data - that's why charts show "No data here"
-
----
-
-## 🧪 Testing Checklist
-
-After running the SQL:
-
-### Database
-- [ ] 23 prices in market_prices_latest
-- [ ] 690 daily candles
-- [ ] 3,887 hourly candles
-
-### Charts
-- [ ] Chart displays candlesticks
-- [ ] Can switch symbols
-- [ ] Can change timeframes
-- [ ] Watchlist shows 4 symbols
-
-### Trading
-- [ ] Can place market orders
-- [ ] Position appears in panel
-- [ ] Entry price is correct
-- [ ] P&L updates in real-time
-- [ ] Can close position
-- [ ] Can modify SL/TP
-
-### Backend
-- [ ] place-order function works
-- [ ] close-position function works  
-- [ ] price-engine returns prices
-- [ ] No console errors
-
----
-
-## 🛠️ Troubleshooting
-
-### Chart Still Shows "No Data"
-
-**Solution**: Hard refresh browser
-- Windows/Linux: `Ctrl + F5`
-- Mac: `Cmd + Shift + R`
-
-### Can't Place Orders
-
-**Error: "No competition selected"**
-- Go to /competitions
-- Join any competition
-- Return to /trading
-
-**Error: "Insufficient margin"**
-- Use smaller quantity (0.01 instead of 0.1)
-- Or reduce leverage
-
-### Orders Failing
-
-1. **Check browser console** (F12)
-2. **Look for errors** in red
-3. **Check Supabase logs**: 
-   - Dashboard → Edge Functions → Logs
-   - Look at place-order logs
-
-### Account Manager Blank
-
-**This is expected** - known TradingView issue
-
-But don't worry:
-- ✅ Positions still work
-- ✅ P&L still calculates
-- ✅ Balance updates correctly
-- ✅ Everything functions normally
-
----
-
-## 📊 Database Schema Quick Reference
-
-### Key Tables
-
-**market_prices_latest** - Current prices
+**.env.local**
 ```
-instrument_id | price | bid | ask | ts | source
+VITE_SUPABASE_URL=your_supabase_url
+VITE_SUPABASE_ANON_KEY=your_anon_key
 ```
 
-**market_candles** - Historical OHLCV
+**Supabase Secrets (for Edge Functions)**
 ```
-instrument_id | timeframe | ts_open | open | high | low | close | volume
-```
-
-**positions** - Trading positions
-```
-id | account_id | instrument_id | side | qty | entry_price | 
-current_price | unrealized_pnl | stop_loss | take_profit | status
+SUPABASE_URL=your_supabase_url
+SUPABASE_ANON_KEY=your_anon_key
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+TWELVE_DATA_API_KEY=your_twelve_data_api_key
 ```
 
-**orders** - Order history
+## 🎯 Key Implementation Details
+
+### Broker Implementation
+
+The `broker.ts` implements TradingView's Broker API:
+
+```typescript
+// Key methods
+placeOrder(preOrder: PreOrder)      // Place market/limit/stop orders
+closePosition(positionId: string)    // Close a position
+reversePosition(positionId: string)  // Reverse position direction
+editPositionBrackets(id, brackets)   // Update SL/TP
+positions()                          // Get all positions
+orders()                            // Get all orders
 ```
-id | account_id | instrument_id | side | order_type | qty | 
-filled_price | status
+
+### P&L Calculation
+
+```typescript
+// For BUY positions: close at BID
+// For SELL positions: close at ASK
+const exitPrice = side === 'buy' ? bid : ask;
+const priceDiff = side === 'buy' ? exitPrice - entryPrice : entryPrice - exitPrice;
+const pnl = priceDiff * quantity * contractSize;
 ```
 
-**accounts** - Trading accounts
+### Multi-Account Support
+
+Users can participate in multiple competitions simultaneously. Each competition creates a separate trading account:
+
 ```
-id | participant_id | balance | equity | used_margin | 
-peak_equity | max_drawdown_pct | status
+User → CompetitionParticipant → Account → Positions
+         └──────────────────────→ Account → Positions
 ```
 
----
+## 🔄 Background Jobs
 
-## 🔌 API Endpoints
+The following edge functions should be called periodically:
 
-### Edge Functions
+1. **sltp-trigger-engine** (every 5-10 seconds)
+   - Checks all positions with SL/TP
+   - Closes positions when price hits levels
 
-**place-order**
+2. **pnl-update-engine** (every 5-10 seconds)
+   - Updates unrealized P&L for all open positions
+   - Updates account equity values
+
+### Setting Up Cron Jobs
+
+Using an external cron service (e.g., cron-job.org):
+
 ```bash
-POST /functions/v1/place-order
-Body: {
-  competition_id, instrument_id, side, quantity, 
-  leverage, stop_loss, take_profit
-}
+# Every 10 seconds
+POST https://your-supabase-url/functions/v1/sltp-trigger-engine
+POST https://your-supabase-url/functions/v1/pnl-update-engine
 ```
 
-**close-position**
-```bash
-POST /functions/v1/close-position
-Body: { position_id, competition_id }
-```
+## 🧪 Testing
 
-**price-engine**
-```bash
-POST /functions/v1/price-engine
-Body: { symbols: ["EURUSD", "BTCUSD"], update_db: true }
-```
+### Test with Mock Data
 
----
+The system uses mock data when no real price data is available:
+- Mock prices are generated based on symbol base prices
+- Mock candles are generated for chart display
+
+### Test Order Flow
+
+1. Join a competition (creates account with starting balance)
+2. Open a position on Trading page
+3. Set SL/TP via bracket editor or chart drag
+4. Verify P&L updates in Account Manager
+5. Close position and check balance update
+
+## 📊 Supported Instruments
+
+### Forex (Default leverage: 100x)
+- EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD, NZDUSD
+
+### Crypto (Default leverage: 10x)
+- BTCUSD, ETHUSD, SOLUSD, BNBUSD, XRPUSD
+
+### Commodities (Default leverage: 20x)
+- XAUUSD (Gold), XAGUSD (Silver)
+
+### Indices (Default leverage: 50x)
+- US500 (S&P 500), US30 (Dow Jones), NAS100 (Nasdaq)
 
 ## 🚀 Deployment
 
-### Production Checklist
+### Deploy Edge Functions
 
-1. **Build**
-   ```bash
-   npm run build
-   ```
+```bash
+supabase functions deploy place-order
+supabase functions deploy close-position
+supabase functions deploy update-position-brackets
+supabase functions deploy join-competition
+supabase functions deploy price-engine
+supabase functions deploy candles-engine
+supabase functions deploy sltp-trigger-engine
+supabase functions deploy pnl-update-engine
+```
 
-2. **Test locally**
-   ```bash
-   npm run preview
-   ```
+### Set Secrets
 
-3. **Deploy**
-   ```bash
-   git add .
-   git commit -m "Add market data"
-   git push origin main
-   ```
+```bash
+supabase secrets set TWELVE_DATA_API_KEY=your_key
+```
 
-4. **Vercel auto-deploys** ✅
+## 📝 License
 
----
-
-## 📚 Documentation
-
-- **Quick Fix**: `QUICK_FIX.md`
-- **Complete Guide**: `docs/COMPLETE_FIX_GUIDE.md` (20 pages)
-- **Backend Review**: `docs/TRADING_BACKEND_COMPREHENSIVE_REVIEW.md`
-- **Trading Workflow**: `docs/TRADING_WORKFLOW_COMPLETE.md`
-- **Troubleshooting**: `docs/FIX_CHART_NO_DATA.md`
+Proprietary - TradeArena Platform
 
 ---
 
-## 🎯 Success Criteria
-
-✅ **Charts display with data**  
-✅ **Can place BUY/SELL orders**  
-✅ **Positions appear in panel**  
-✅ **P&L calculates correctly**  
-✅ **Can close positions**  
-✅ **Can modify SL/TP**  
-✅ **Margin management works**  
-✅ **Drawdown monitoring active**
-
----
-
-## 💡 Tips
-
-1. **Use small quantities** for testing (0.01-0.1 lots)
-2. **Start with EURUSD** (most liquid)
-3. **Check console** for debugging (F12)
-4. **Monitor Edge Function logs** in Supabase
-5. **Hard refresh** after changes (Ctrl+F5)
-
----
-
-## 🆘 Support
-
-If you encounter issues:
-
-1. **Check browser console** (F12)
-2. **Check Supabase logs** (Dashboard → Edge Functions)
-3. **Review documentation** in `/docs`
-4. **Verify SQL ran successfully** (check counts)
-5. **Test with curl** (examples in `test-backend.sh`)
-
----
-
-## 🎉 You're Ready!
-
-Your **production-grade MetaTrader-style trading platform** is complete!
-
-**Just run the SQL and start trading.** 🚀
-
----
-
-**Created**: January 16, 2026  
-**Version**: 1.0  
-**Status**: Production Ready  
-**Project**: TradeArena Trading Platform
+**Version**: 1.0.0  
+**Last Updated**: January 2026
 
