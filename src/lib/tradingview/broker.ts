@@ -8,6 +8,7 @@
  * - Account Manager integration
  * - Multiple accounts support (for competitions)
  * - P&L preview for SL/TP brackets
+ * - Persistent SL/TP lines on chart reload
  */
 
 import { supabase } from "@/integrations/supabase/client";
@@ -45,6 +46,12 @@ export enum OrderStatus {
 export enum ParentType {
   Order = 1,
   Position = 2,
+}
+
+// Stop type for bracket orders
+export enum StopType {
+  StopLoss = 0,
+  TrailingStop = 1,
 }
 
 export enum StandardFormatterName {
@@ -92,6 +99,7 @@ export interface Order {
   takeProfit?: number;
   parentId?: string;
   parentType?: ParentType;
+  stopType?: StopType;
   last?: number;
   price?: number;
   avgPrice?: number;
@@ -206,9 +214,6 @@ export class TradeArenaBroker {
     try {
       console.log("[TradeArenaBroker] Loading user accounts for userId:", this._userId);
       
-      // Query accounts joined with competition_participants and competitions
-      // Schema: accounts.participant_id -> competition_participants.id
-      //         competition_participants.competition_id -> competitions.id
       const { data, error } = await supabase
         .from('accounts')
         .select(`
@@ -226,7 +231,6 @@ export class TradeArenaBroker {
 
       if (error) {
         console.error("[TradeArenaBroker] Failed to load user accounts:", error);
-        // Fallback to single account
         this._accounts = [{
           id: this._accountId,
           name: 'TradeArena Trading Account',
@@ -247,7 +251,6 @@ export class TradeArenaBroker {
         return;
       }
 
-      // Map to AccountInfo format
       this._accounts = data.map((row: any) => ({
         id: row.id,
         name: row.participant?.competition?.name || 'Trading Account',
@@ -271,16 +274,11 @@ export class TradeArenaBroker {
     }
   }
 
-  /**
-   * Returns list of accounts for TradingView's account switcher dropdown
-   */
   async accountsMetainfo(): Promise<any[]> {
-    // Wait for accounts to load if not ready
     if (!this._accountsLoaded && this._accounts.length === 0) {
       await this._loadUserAccounts();
     }
 
-    // Return accounts in TradingView's expected format
     return this._accounts.map(acc => ({
       id: acc.id,
       name: acc.competitionName ? `${acc.competitionName}` : acc.name,
@@ -288,9 +286,6 @@ export class TradeArenaBroker {
     }));
   }
 
-  /**
-   * Called by TradingView when user switches accounts in the dropdown
-   */
   async setCurrentAccount(accountId: string): Promise<void> {
     console.log("[TradeArenaBroker] 🔄 Switching to account:", accountId);
     
@@ -299,32 +294,26 @@ export class TradeArenaBroker {
       return;
     }
 
-    // Find the account in our cached list
     const account = this._accounts.find(a => a.id === accountId);
     if (!account) {
       console.error("[TradeArenaBroker] Account not found in cache:", accountId);
       throw new Error("Account not found");
     }
 
-    // Update current account
     this._accountId = accountId;
     
-    // Use competition ID from cached account
     if (account.competitionId) {
       this._competitionId = account.competitionId;
       console.log("[TradeArenaBroker] Updated competition ID from cache:", this._competitionId);
     }
     
-    // Clear caches
     this._positions = [];
     this._positionById.clear();
     this._orderById.clear();
 
-    // Reload all data for new account
     await this._loadInitialDataAndNotify();
     await this._updateAccountData();
 
-    // Notify TradingView of account switch
     this._host.currentAccountUpdate?.();
     
     toast.success(`Switched to ${account.name}`);
@@ -340,20 +329,17 @@ export class TradeArenaBroker {
       const mintick = await this._host.getSymbolMinTick(symbol);
       const pipSize = mintick || 0.0001;
       
-      // Get contract size for proper pipValue calculation
-      // pipValue = pipSize * contractSize (e.g., 0.0001 * 100000 = $10 per pip for forex)
-      let contractSize = 100000; // Default for forex
+      let contractSize = 100000;
       try {
         const instrument = await this._getInstrumentData(symbol);
         contractSize = instrument.contract_size || 100000;
       } catch {
-        // Default contract sizes based on symbol type
         if (['XAUUSD', 'XAGUSD'].includes(symbol)) {
-          contractSize = 100; // Metals
+          contractSize = 100;
         } else if (symbol.includes('BTC') || symbol.includes('ETH')) {
-          contractSize = 1; // Crypto
+          contractSize = 1;
         } else if (symbol.length === 6) {
-          contractSize = 100000; // Forex pairs
+          contractSize = 100000;
         }
       }
       
@@ -367,21 +353,16 @@ export class TradeArenaBroker {
         description: symbol,
       };
     } catch (error) {
-      // Fallback with forex defaults
       return {
         qty: { min: 0.01, max: 1000, step: 0.01, default: 0.1 },
         pipSize: 0.0001,
-        pipValue: 10, // Default for forex: 0.0001 * 100000
+        pipValue: 10,
         minTick: 0.0001,
         description: symbol,
       };
     }
   }
 
-  /**
-   * Calculate P&L for bracket order preview (SL/TP lines on chart)
-   * Called by TradingView when user drags SL/TP lines to show potential P&L
-   */
   async calculatePLForBracketOrder(
     positionId: string,
     brackets: Brackets
@@ -392,7 +373,6 @@ export class TradeArenaBroker {
       return { pl: 0, plPercent: 0 };
     }
 
-    // Get contract size for P&L calculation
     let contractSize = position.contractSize || 100000;
     try {
       const instrument = await this._getInstrumentData(position.symbol);
@@ -401,16 +381,13 @@ export class TradeArenaBroker {
       // Use default
     }
 
-    // Calculate P&L for the bracket level (SL or TP)
     const bracketPrice = brackets.stopLoss || brackets.takeProfit || position.avgPrice;
     const priceDiff = position.side === Side.Buy 
       ? bracketPrice - position.avgPrice 
       : position.avgPrice - bracketPrice;
     
-    // P&L = priceDiff × qty × contractSize
     const pl = priceDiff * position.qty * contractSize;
     
-    // Calculate percentage based on position value
     const positionValue = position.avgPrice * position.qty * contractSize;
     const plPercent = positionValue > 0 ? (pl / positionValue) * 100 : 0;
 
@@ -433,12 +410,20 @@ export class TradeArenaBroker {
     await this._loadPositions();
     await this._updateAccountData();
     
+    // Notify TradingView of all positions
     for (const position of this._positions) {
+      console.log("[TradeArenaBroker] Notifying position:", position.id, "SL:", position.stopLoss, "TP:", position.takeProfit);
       this._host.positionUpdate(position);
     }
     
+    // Notify TradingView of all bracket orders (SL/TP as pending orders)
+    for (const order of this._orderById.values()) {
+      console.log("[TradeArenaBroker] Notifying bracket order:", order.id, "parentId:", order.parentId);
+      this._host.orderUpdate(order);
+    }
+    
     this._initialDataLoaded = true;
-    console.log("[TradeArenaBroker] ✅ Initial data loaded and notified", this._positions.length, "positions");
+    console.log("[TradeArenaBroker] ✅ Initial data loaded and notified", this._positions.length, "positions,", this._orderById.size, "bracket orders");
   }
 
   private async _loadPositions(): Promise<void> {
@@ -468,15 +453,13 @@ export class TradeArenaBroker {
 
       this._positions = [];
       this._positionById.clear();
+      this._orderById.clear();
 
       for (const pos of (data || [])) {
         const avgPrice = Number(pos.entry_price);
         const currentPrice = pos.current_price ? Number(pos.current_price) : avgPrice;
         const contractSize = pos.instrument?.contract_size || 100000;
         
-        // Calculate P&L using contract size
-        // P&L = (currentPrice - avgPrice) × qty × contractSize for BUY
-        // P&L = (avgPrice - currentPrice) × qty × contractSize for SELL
         const priceDiff = pos.side === 'buy' 
           ? currentPrice - avgPrice 
           : avgPrice - currentPrice;
@@ -489,7 +472,6 @@ export class TradeArenaBroker {
           side: pos.side === 'buy' ? Side.Buy : Side.Sell,
           avgPrice: avgPrice,
           price: avgPrice,
-          // Use calculated P&L if unrealized_pnl is 0 or null
           pl: Number(pos.unrealized_pnl) || calculatedPl,
           last: currentPrice,
           stopLoss: pos.stop_loss ? Number(pos.stop_loss) : undefined,
@@ -500,30 +482,91 @@ export class TradeArenaBroker {
 
         this._positions.push(position);
         this._positionById.set(position.id, position);
+
+        // Create bracket orders for SL/TP so TradingView displays them on the chart
+        this._createBracketOrdersForPosition(position);
       }
 
-      console.log("[TradeArenaBroker] 📊 Loaded", this._positions.length, "positions");
+      console.log("[TradeArenaBroker] 📊 Loaded", this._positions.length, "positions with", this._orderById.size, "bracket orders");
     } catch (error) {
       console.error("[TradeArenaBroker] _loadPositions error:", error);
     }
   }
 
+  /**
+   * Create bracket orders (SL/TP) for a position
+   * TradingView displays SL/TP lines on the chart based on orders with parentId/parentType
+   */
+  private _createBracketOrdersForPosition(position: Position): void {
+    // Create Stop Loss order if position has SL
+    if (position.stopLoss) {
+      const slOrderId = `${position.id}_sl`;
+      const slOrder: Order = {
+        id: slOrderId,
+        symbol: position.symbol,
+        type: OrderType.Stop,
+        side: changeSide(position.side), // SL closes position, so opposite side
+        qty: position.qty,
+        status: OrderStatus.Working,
+        stopPrice: position.stopLoss,
+        parentId: position.id,
+        parentType: ParentType.Position,
+        stopType: StopType.StopLoss,
+      };
+      this._orderById.set(slOrderId, slOrder);
+      console.log("[TradeArenaBroker] Created SL bracket order:", slOrderId, "at", position.stopLoss);
+    }
+
+    // Create Take Profit order if position has TP
+    if (position.takeProfit) {
+      const tpOrderId = `${position.id}_tp`;
+      const tpOrder: Order = {
+        id: tpOrderId,
+        symbol: position.symbol,
+        type: OrderType.Limit,
+        side: changeSide(position.side), // TP closes position, so opposite side
+        qty: position.qty,
+        status: OrderStatus.Working,
+        limitPrice: position.takeProfit,
+        parentId: position.id,
+        parentType: ParentType.Position,
+      };
+      this._orderById.set(tpOrderId, tpOrder);
+      console.log("[TradeArenaBroker] Created TP bracket order:", tpOrderId, "at", position.takeProfit);
+    }
+  }
+
   private async _reloadAndNotifyPositions(): Promise<void> {
     const oldPositionIds = new Set(this._positionById.keys());
+    const oldOrderIds = new Set(this._orderById.keys());
     
     await this._loadPositions();
     
+    // Notify positions
     for (const position of this._positions) {
       this._host.positionUpdate(position);
     }
     
+    // Remove old positions
     for (const oldId of oldPositionIds) {
       if (!this._positionById.has(oldId)) {
         this._host.positionUpdate({ id: oldId, qty: 0 } as Position);
       }
     }
+
+    // Notify bracket orders
+    for (const order of this._orderById.values()) {
+      this._host.orderUpdate(order);
+    }
+
+    // Cancel old bracket orders that no longer exist
+    for (const oldId of oldOrderIds) {
+      if (!this._orderById.has(oldId)) {
+        this._host.orderUpdate({ id: oldId, status: OrderStatus.Canceled } as Order);
+      }
+    }
     
-    console.log("[TradeArenaBroker] 🔄 Reloaded and notified", this._positions.length, "positions");
+    console.log("[TradeArenaBroker] 🔄 Reloaded and notified", this._positions.length, "positions,", this._orderById.size, "bracket orders");
   }
 
   async positions(): Promise<Position[]> {
@@ -562,17 +605,92 @@ export class TradeArenaBroker {
 
       console.log("[TradeArenaBroker] ✅ Backend updated brackets:", data);
 
+      // Update local position
       position.stopLoss = brackets.stopLoss;
       position.takeProfit = brackets.takeProfit;
       this._host.positionUpdate(position);
 
-      console.log("[TradeArenaBroker] ✅ positionUpdate called with:", position);
+      // Update or create/remove bracket orders
+      this._updateBracketOrdersForPosition(position, brackets);
+
+      console.log("[TradeArenaBroker] ✅ positionUpdate and orderUpdate called");
       toast.success("Brackets updated successfully");
 
     } catch (error: any) {
       console.error("[TradeArenaBroker] ❌ editPositionBrackets error:", error);
       toast.error(error.message || "Failed to update brackets");
       throw error;
+    }
+  }
+
+  /**
+   * Update bracket orders when SL/TP changes
+   */
+  private _updateBracketOrdersForPosition(position: Position, brackets: Brackets): void {
+    const slOrderId = `${position.id}_sl`;
+    const tpOrderId = `${position.id}_tp`;
+
+    // Handle Stop Loss
+    if (brackets.stopLoss) {
+      const existingSlOrder = this._orderById.get(slOrderId);
+      if (existingSlOrder) {
+        // Update existing SL order
+        existingSlOrder.stopPrice = brackets.stopLoss;
+        this._host.orderUpdate(existingSlOrder);
+      } else {
+        // Create new SL order
+        const slOrder: Order = {
+          id: slOrderId,
+          symbol: position.symbol,
+          type: OrderType.Stop,
+          side: changeSide(position.side),
+          qty: position.qty,
+          status: OrderStatus.Working,
+          stopPrice: brackets.stopLoss,
+          parentId: position.id,
+          parentType: ParentType.Position,
+          stopType: StopType.StopLoss,
+        };
+        this._orderById.set(slOrderId, slOrder);
+        this._host.orderUpdate(slOrder);
+      }
+    } else {
+      // Remove SL order if it exists
+      if (this._orderById.has(slOrderId)) {
+        this._host.orderUpdate({ id: slOrderId, status: OrderStatus.Canceled } as Order);
+        this._orderById.delete(slOrderId);
+      }
+    }
+
+    // Handle Take Profit
+    if (brackets.takeProfit) {
+      const existingTpOrder = this._orderById.get(tpOrderId);
+      if (existingTpOrder) {
+        // Update existing TP order
+        existingTpOrder.limitPrice = brackets.takeProfit;
+        this._host.orderUpdate(existingTpOrder);
+      } else {
+        // Create new TP order
+        const tpOrder: Order = {
+          id: tpOrderId,
+          symbol: position.symbol,
+          type: OrderType.Limit,
+          side: changeSide(position.side),
+          qty: position.qty,
+          status: OrderStatus.Working,
+          limitPrice: brackets.takeProfit,
+          parentId: position.id,
+          parentType: ParentType.Position,
+        };
+        this._orderById.set(tpOrderId, tpOrder);
+        this._host.orderUpdate(tpOrder);
+      }
+    } else {
+      // Remove TP order if it exists
+      if (this._orderById.has(tpOrderId)) {
+        this._host.orderUpdate({ id: tpOrderId, status: OrderStatus.Canceled } as Order);
+        this._orderById.delete(tpOrderId);
+      }
     }
   }
 
@@ -687,6 +805,29 @@ export class TradeArenaBroker {
   async modifyOrder(order: Order): Promise<void> {
     console.log("[TradeArenaBroker] 🔧 modifyOrder:", order);
     
+    // Check if this is a bracket order (SL/TP)
+    if (order.parentId && order.parentType === ParentType.Position) {
+      // This is a bracket order - update the position's brackets
+      const position = this._positionById.get(order.parentId);
+      if (position) {
+        const brackets: Brackets = {
+          stopLoss: position.stopLoss,
+          takeProfit: position.takeProfit,
+        };
+
+        // Determine which bracket is being modified
+        if (order.id.endsWith('_sl')) {
+          brackets.stopLoss = order.stopPrice;
+        } else if (order.id.endsWith('_tp')) {
+          brackets.takeProfit = order.limitPrice;
+        }
+
+        await this.editPositionBrackets(order.parentId, brackets);
+        return;
+      }
+    }
+
+    // Regular order modification
     try {
       const { error } = await supabase
         .from('orders')
@@ -714,6 +855,30 @@ export class TradeArenaBroker {
   async cancelOrder(orderId: string): Promise<void> {
     console.log("[TradeArenaBroker] 🚫 cancelOrder:", orderId);
 
+    // Check if this is a bracket order
+    const order = this._orderById.get(orderId);
+    if (order?.parentId && order.parentType === ParentType.Position) {
+      // This is a bracket order - remove the bracket from the position
+      const position = this._positionById.get(order.parentId);
+      if (position) {
+        const brackets: Brackets = {
+          stopLoss: position.stopLoss,
+          takeProfit: position.takeProfit,
+        };
+
+        // Remove the appropriate bracket
+        if (orderId.endsWith('_sl')) {
+          brackets.stopLoss = undefined;
+        } else if (orderId.endsWith('_tp')) {
+          brackets.takeProfit = undefined;
+        }
+
+        await this.editPositionBrackets(order.parentId, brackets);
+        return;
+      }
+    }
+
+    // Regular order cancellation
     try {
       const { error } = await supabase
         .from('orders')
@@ -723,7 +888,6 @@ export class TradeArenaBroker {
 
       if (error) throw new Error(error.message);
 
-      const order = this._orderById.get(orderId);
       if (order) {
         order.status = OrderStatus.Canceled;
         this._updateOrder(order);
@@ -782,6 +946,19 @@ export class TradeArenaBroker {
 
       console.log("[TradeArenaBroker] ✅ Position closed successfully:", data);
       toast.success("Position closed successfully");
+
+      // Remove bracket orders for this position
+      const slOrderId = `${positionId}_sl`;
+      const tpOrderId = `${positionId}_tp`;
+      
+      if (this._orderById.has(slOrderId)) {
+        this._host.orderUpdate({ id: slOrderId, status: OrderStatus.Canceled } as Order);
+        this._orderById.delete(slOrderId);
+      }
+      if (this._orderById.has(tpOrderId)) {
+        this._host.orderUpdate({ id: tpOrderId, status: OrderStatus.Canceled } as Order);
+        this._orderById.delete(tpOrderId);
+      }
 
       position.qty = 0;
       this._host.positionUpdate(position);
@@ -1015,14 +1192,12 @@ export class TradeArenaBroker {
     if (this._positions.length === 0) return;
 
     try {
-      // Get instrument IDs from positions (market_prices_latest uses instrument_id, not symbol)
       const instrumentIds = this._positions
         .map(p => p.instrumentId)
         .filter((id): id is string => !!id);
       
       if (instrumentIds.length === 0) return;
 
-      // Query market_prices_latest by instrument_id
       const { data: prices, error } = await supabase
         .from('market_prices_latest')
         .select('instrument_id, bid, ask')
@@ -1035,7 +1210,6 @@ export class TradeArenaBroker {
 
       if (!prices || prices.length === 0) return;
 
-      // Create map by instrument_id
       const priceMap = new Map(prices.map(p => [p.instrument_id, p]));
 
       for (const position of this._positions) {
@@ -1043,8 +1217,6 @@ export class TradeArenaBroker {
         
         const priceData = priceMap.get(position.instrumentId);
         if (priceData) {
-          // Use bid for BUY positions (mark-to-market: can sell at bid)
-          // Use ask for SELL positions (mark-to-market: can buy back at ask)
           const currentPrice = position.side === Side.Buy 
             ? Number(priceData.bid) 
             : Number(priceData.ask);
@@ -1069,7 +1241,6 @@ export class TradeArenaBroker {
       }
     } catch (error) {
       console.error("[TradeArenaBroker] _updatePositionPrices error:", error);
-      // Fallback: use local calculation without live prices
       for (const position of this._positions) {
         if (position.last && position.last !== position.avgPrice) {
           const contractSize = position.contractSize || 100000;
