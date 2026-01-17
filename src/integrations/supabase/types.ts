@@ -309,6 +309,8 @@ export type Database = {
           created_at: string
           id: string
           is_active: boolean
+          leverage_default: number
+          min_tick: number
           name: string
           quantity_type: Database["public"]["Enums"]["quantity_type"]
           quote_currency: string | null
@@ -323,6 +325,8 @@ export type Database = {
           created_at?: string
           id?: string
           is_active?: boolean
+          leverage_default?: number
+          min_tick?: number
           name: string
           quantity_type?: Database["public"]["Enums"]["quantity_type"]
           quote_currency?: string | null
@@ -337,6 +341,8 @@ export type Database = {
           created_at?: string
           id?: string
           is_active?: boolean
+          leverage_default?: number
+          min_tick?: number
           name?: string
           quantity_type?: Database["public"]["Enums"]["quantity_type"]
           quote_currency?: string | null
@@ -436,6 +442,7 @@ export type Database = {
           id: string
           instrument_id: string
           leverage: number
+          limit_price: number | null
           margin_used: number | null
           order_type: Database["public"]["Enums"]["order_type"]
           quantity: number
@@ -444,6 +451,7 @@ export type Database = {
           side: Database["public"]["Enums"]["order_side"]
           status: Database["public"]["Enums"]["order_status"]
           stop_loss: number | null
+          stop_price: number | null
           take_profit: number | null
         }
         Insert: {
@@ -453,6 +461,7 @@ export type Database = {
           id?: string
           instrument_id: string
           leverage?: number
+          limit_price?: number | null
           margin_used?: number | null
           order_type?: Database["public"]["Enums"]["order_type"]
           quantity: number
@@ -461,6 +470,7 @@ export type Database = {
           side: Database["public"]["Enums"]["order_side"]
           status?: Database["public"]["Enums"]["order_status"]
           stop_loss?: number | null
+          stop_price?: number | null
           take_profit?: number | null
         }
         Update: {
@@ -470,6 +480,7 @@ export type Database = {
           id?: string
           instrument_id?: string
           leverage?: number
+          limit_price?: number | null
           margin_used?: number | null
           order_type?: Database["public"]["Enums"]["order_type"]
           quantity?: number
@@ -478,6 +489,7 @@ export type Database = {
           side?: Database["public"]["Enums"]["order_side"]
           status?: Database["public"]["Enums"]["order_status"]
           stop_loss?: number | null
+          stop_price?: number | null
           take_profit?: number | null
         }
         Relationships: [
