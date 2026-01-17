@@ -344,7 +344,7 @@ export class TradeArenaBroker {
       .from('instruments')
       .select('id, leverage_default, contract_size')
       .eq('symbol', symbol)
-      .single();
+      .single() as { data: { id: string; leverage_default: number; contract_size: number } | null; error: any };
 
     if (error || !data) {
       throw new Error(`Instrument ${symbol} not found`);
