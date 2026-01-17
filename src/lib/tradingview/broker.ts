@@ -76,6 +76,7 @@ export interface Position {
   stopLoss?: number;
   takeProfit?: number;
   contractSize?: number;
+  instrumentId?: string; // For price lookups
 }
 
 export interface Order {
@@ -134,6 +135,7 @@ interface AccountInfo {
   name: string;
   currency: string;
   balance?: number;
+  competitionId?: string;
   competitionName?: string;
 }
 
@@ -198,21 +200,29 @@ export class TradeArenaBroker {
 
   /**
    * Load all competition accounts for this user
-   * This enables the account switcher in TradingView's Account Manager
+   * Schema: competition_participants.id -> accounts.participant_id
    */
   private async _loadUserAccounts(): Promise<void> {
     try {
       console.log("[TradeArenaBroker] Loading user accounts for userId:", this._userId);
       
-      // Query competition_participants to get all accounts for this user
+      // Query accounts joined with competition_participants and competitions
+      // Schema: accounts.participant_id -> competition_participants.id
+      //         competition_participants.competition_id -> competitions.id
       const { data, error } = await supabase
-        .from('competition_participants')
+        .from('accounts')
         .select(`
-          account_id,
-          competition:competitions!inner(id, name),
-          account:accounts!inner(id, balance, equity)
+          id,
+          balance,
+          equity,
+          participant:competition_participants!inner(
+            id,
+            user_id,
+            competition_id,
+            competition:competitions!inner(id, name)
+          )
         `)
-        .eq('user_id', this._userId);
+        .eq('participant.user_id', this._userId);
 
       if (error) {
         console.error("[TradeArenaBroker] Failed to load user accounts:", error);
@@ -222,6 +232,7 @@ export class TradeArenaBroker {
           name: 'TradeArena Trading Account',
           currency: 'USD',
         }];
+        this._accountsLoaded = true;
         return;
       }
 
@@ -232,16 +243,18 @@ export class TradeArenaBroker {
           name: 'TradeArena Trading Account',
           currency: 'USD',
         }];
+        this._accountsLoaded = true;
         return;
       }
 
       // Map to AccountInfo format
       this._accounts = data.map((row: any) => ({
-        id: row.account_id,
-        name: row.competition?.name || 'Trading Account',
+        id: row.id,
+        name: row.participant?.competition?.name || 'Trading Account',
         currency: 'USD',
-        balance: row.account?.balance,
-        competitionName: row.competition?.name,
+        balance: row.balance,
+        competitionId: row.participant?.competition_id,
+        competitionName: row.participant?.competition?.name,
       }));
 
       console.log("[TradeArenaBroker] ✅ Loaded", this._accounts.length, "accounts:", this._accounts);
@@ -254,6 +267,7 @@ export class TradeArenaBroker {
         name: 'TradeArena Trading Account',
         currency: 'USD',
       }];
+      this._accountsLoaded = true;
     }
   }
 
@@ -285,37 +299,26 @@ export class TradeArenaBroker {
       return;
     }
 
-    // Find the account to get its competition ID
+    // Find the account in our cached list
     const account = this._accounts.find(a => a.id === accountId);
     if (!account) {
-      console.error("[TradeArenaBroker] Account not found:", accountId);
+      console.error("[TradeArenaBroker] Account not found in cache:", accountId);
       throw new Error("Account not found");
     }
 
     // Update current account
     this._accountId = accountId;
     
+    // Use competition ID from cached account
+    if (account.competitionId) {
+      this._competitionId = account.competitionId;
+      console.log("[TradeArenaBroker] Updated competition ID from cache:", this._competitionId);
+    }
+    
     // Clear caches
     this._positions = [];
     this._positionById.clear();
     this._orderById.clear();
-
-    // Find competition ID for this account
-    try {
-      const { data } = await supabase
-        .from('competition_participants')
-        .select('competition_id')
-        .eq('account_id', accountId)
-        .eq('user_id', this._userId)
-        .single();
-      
-      if (data) {
-        this._competitionId = data.competition_id;
-        console.log("[TradeArenaBroker] Updated competition ID:", this._competitionId);
-      }
-    } catch (error) {
-      console.error("[TradeArenaBroker] Failed to get competition ID:", error);
-    }
 
     // Reload all data for new account
     await this._loadInitialDataAndNotify();
@@ -452,7 +455,8 @@ export class TradeArenaBroker {
           stop_loss,
           take_profit,
           status,
-          instrument:instruments!inner(symbol, name, contract_size)
+          instrument_id,
+          instrument:instruments!inner(id, symbol, name, contract_size)
         `)
         .eq('account_id', this._accountId)
         .eq('status', 'open');
@@ -491,6 +495,7 @@ export class TradeArenaBroker {
           stopLoss: pos.stop_loss ? Number(pos.stop_loss) : undefined,
           takeProfit: pos.take_profit ? Number(pos.take_profit) : undefined,
           contractSize: contractSize,
+          instrumentId: pos.instrument_id,
         };
 
         this._positions.push(position);
@@ -1007,27 +1012,39 @@ export class TradeArenaBroker {
   }
 
   private async _updatePositionPrices(): Promise<void> {
-    // Fetch latest prices from market_prices_latest
+    if (this._positions.length === 0) return;
+
     try {
-      const symbols = this._positions.map(p => p.symbol);
-      if (symbols.length === 0) return;
+      // Get instrument IDs from positions (market_prices_latest uses instrument_id, not symbol)
+      const instrumentIds = this._positions
+        .map(p => p.instrumentId)
+        .filter((id): id is string => !!id);
+      
+      if (instrumentIds.length === 0) return;
 
-      const { data: prices } = await supabase
+      // Query market_prices_latest by instrument_id
+      const { data: prices, error } = await supabase
         .from('market_prices_latest')
-        .select('symbol, bid, ask')
-        .in('symbol', symbols);
+        .select('instrument_id, bid, ask')
+        .in('instrument_id', instrumentIds);
 
-      if (!prices) return;
+      if (error) {
+        console.error("[TradeArenaBroker] Failed to fetch prices:", error);
+        return;
+      }
 
-      const priceMap = new Map(prices.map(p => [p.symbol, p]));
+      if (!prices || prices.length === 0) return;
+
+      // Create map by instrument_id
+      const priceMap = new Map(prices.map(p => [p.instrument_id, p]));
 
       for (const position of this._positions) {
-        const priceData = priceMap.get(position.symbol);
+        if (!position.instrumentId) continue;
+        
+        const priceData = priceMap.get(position.instrumentId);
         if (priceData) {
-          // Use bid for SELL positions (closing a sell = buying at bid)
-          // Use ask for BUY positions (closing a buy = selling at ask)
-          // Actually for P&L: BUY profits when price goes up (use bid for mark-to-market)
-          // SELL profits when price goes down (use ask for mark-to-market)
+          // Use bid for BUY positions (mark-to-market: can sell at bid)
+          // Use ask for SELL positions (mark-to-market: can buy back at ask)
           const currentPrice = position.side === Side.Buy 
             ? Number(priceData.bid) 
             : Number(priceData.ask);
@@ -1051,7 +1068,8 @@ export class TradeArenaBroker {
         }
       }
     } catch (error) {
-      // Fallback to simple calculation if no prices available
+      console.error("[TradeArenaBroker] _updatePositionPrices error:", error);
+      // Fallback: use local calculation without live prices
       for (const position of this._positions) {
         if (position.last && position.last !== position.avgPrice) {
           const contractSize = position.contractSize || 100000;
