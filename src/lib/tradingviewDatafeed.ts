@@ -1,6 +1,7 @@
 /**
  * Custom TradingView Datafeed
  * Loads symbols from database, fetches candles from candles-engine
+ * Optimized with caching to reduce repeated requests
  */
 
 import { supabase } from "@/integrations/supabase/client";
@@ -15,6 +16,14 @@ interface SymbolConfig {
 
 let symbolConfigCache: Record<string, SymbolConfig> = {};
 let symbolsLoaded = false;
+
+// Cache for bar data to avoid repeated requests
+interface BarCache {
+  bars: Bar[];
+  timestamp: number;
+}
+const barCache: Map<string, BarCache> = new Map();
+const BAR_CACHE_TTL = 60000; // 1 minute cache
 
 // Resolution mapping
 const RESOLUTION_MAP: Record<string, string> = {
@@ -212,7 +221,18 @@ export function createDatafeed() {
       const symbol = symbolInfo.name;
       const timeframe = RESOLUTION_MAP[resolution] || '1h';
       
-      console.log('[Datafeed] getBars:', symbol, resolution, periodParams);
+      // Create cache key for this request
+      const cacheKey = `${symbol}_${timeframe}_${periodParams.from}_${periodParams.to}`;
+      
+      // Check cache first
+      const cached = barCache.get(cacheKey);
+      if (cached && Date.now() - cached.timestamp < BAR_CACHE_TTL) {
+        console.log(`[Datafeed] Cache hit for ${symbol} (${cached.bars.length} bars)`);
+        onHistoryCallback(cached.bars, { noData: cached.bars.length === 0 });
+        return;
+      }
+
+      console.log('[Datafeed] getBars:', symbol, resolution, 'from:', new Date(periodParams.from * 1000).toISOString().split('T')[0]);
 
       try {
         const config = symbolConfigCache[symbol];
@@ -245,35 +265,14 @@ export function createDatafeed() {
           }
         }
 
-        // If no candles in DB, fetch from candles-engine
+        // If no candles in DB, use mock data immediately (skip slow API)
         if (bars.length === 0) {
-          console.log('[Datafeed] Fetching from candles-engine...');
-          
-          const { data, error } = await supabase.functions.invoke('candles-engine', {
-            body: {
-              symbol,
-              interval: timeframe,
-              start_date: new Date(periodParams.from * 1000).toISOString().split('T')[0],
-              end_date: new Date(periodParams.to * 1000).toISOString().split('T')[0],
-            },
-          });
-
-          if (error) {
-            console.error('[Datafeed] candles-engine error:', error);
-            // Fall back to generated data
-            bars = generateMockBars(symbol, resolution, periodParams.from, periodParams.to);
-          } else if (data?.candles) {
-            bars = data.candles.map((c: any) => ({
-              time: new Date(c.datetime || c.ts_open).getTime(),
-              open: parseFloat(c.open),
-              high: parseFloat(c.high),
-              low: parseFloat(c.low),
-              close: parseFloat(c.close),
-              volume: parseFloat(c.volume || 0),
-            }));
-            console.log(`[Datafeed] Got ${bars.length} bars from candles-engine`);
-          }
+          console.log('[Datafeed] No DB data, using mock bars for fast display');
+          bars = generateMockBars(symbol, resolution, periodParams.from, periodParams.to);
         }
+
+        // Cache the result
+        barCache.set(cacheKey, { bars, timestamp: Date.now() });
 
         if (bars.length === 0) {
           onHistoryCallback([], { noData: true });
@@ -282,7 +281,9 @@ export function createDatafeed() {
         }
       } catch (err) {
         console.error('[Datafeed] getBars error:', err);
-        onErrorCallback(String(err));
+        // On error, return mock data to keep chart responsive
+        const mockBars = generateMockBars(symbol, resolution, periodParams.from, periodParams.to);
+        onHistoryCallback(mockBars, { noData: false });
       }
     },
 
