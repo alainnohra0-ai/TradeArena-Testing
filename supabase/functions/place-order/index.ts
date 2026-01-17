@@ -15,7 +15,7 @@ interface OrderRequest {
   stop_loss?: number;
   take_profit?: number;
   client_price?: number;
-  order_type?: 'market' | 'limit' | 'stop';
+  order_type?: 'market' | 'limit' | 'stop' | 'stop_limit';
   requested_price?: number;
   create_new_position?: boolean;
 }
@@ -69,23 +69,30 @@ serve(async (req) => {
   try {
     const authHeader = req.headers.get('Authorization');
     if (!authHeader?.startsWith('Bearer ')) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+      return new Response(JSON.stringify({ error: 'Unauthorized - no auth header' }), { 
         status: 401, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
-    const supabase = createClient(
+    // Create client with user's auth for reading data
+    const supabaseUser = createClient(
       Deno.env.get('SUPABASE_URL')!,
       Deno.env.get('SUPABASE_ANON_KEY')!,
       { global: { headers: { Authorization: authHeader } } }
     );
 
-    const { data: { user }, error: userError } = await supabase.auth.getUser();
+    // Create admin client for writes (bypasses RLS)
+    const supabaseAdmin = createClient(
+      Deno.env.get('SUPABASE_URL')!,
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+    );
+
+    const { data: { user }, error: userError } = await supabaseUser.auth.getUser();
     
     if (userError || !user) {
       console.error('Auth error:', userError);
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+      return new Response(JSON.stringify({ error: 'Unauthorized - invalid token' }), { 
         status: 401, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
@@ -129,17 +136,17 @@ serve(async (req) => {
       });
     }
     
-    if ((order_type === 'limit' || order_type === 'stop') && (!requested_price || requested_price <= 0)) {
+    if ((order_type === 'limit' || order_type === 'stop' || order_type === 'stop_limit') && (!requested_price || requested_price <= 0)) {
       return new Response(JSON.stringify({ error: 'Limit/Stop orders require a valid price' }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
-    console.log('Order request:', { userId, competition_id, instrument_id, side, quantity, leverage, order_type });
+    console.log('Order request:', { userId, competition_id, instrument_id, side, quantity, leverage, order_type, requested_price });
 
     // Verify competition is live
-    const { data: competition, error: compError } = await supabase
+    const { data: competition, error: compError } = await supabaseUser
       .from('competitions')
       .select('id, status')
       .eq('id', competition_id)
@@ -160,7 +167,7 @@ serve(async (req) => {
     }
 
     // Get competition rules
-    const { data: rules, error: rulesError } = await supabase
+    const { data: rules, error: rulesError } = await supabaseUser
       .from('competition_rules')
       .select('max_drawdown_pct, max_leverage_global, max_position_pct, starting_balance')
       .eq('competition_id', competition_id)
@@ -174,7 +181,7 @@ serve(async (req) => {
     }
 
     // Check instrument is allowed
-    const { data: compInstrument, error: instrError } = await supabase
+    const { data: compInstrument, error: instrError } = await supabaseUser
       .from('competition_instruments')
       .select('instrument_id, leverage_max_override')
       .eq('competition_id', competition_id)
@@ -199,7 +206,7 @@ serve(async (req) => {
     }
 
     // Get instrument details
-    const { data: instrument, error: getInstrError } = await supabase
+    const { data: instrument, error: getInstrError } = await supabaseUser
       .from('instruments')
       .select('id, symbol, contract_size, tick_size')
       .eq('id', instrument_id)
@@ -213,7 +220,7 @@ serve(async (req) => {
     }
 
     // Get participant and account
-    const { data: participant, error: partError } = await supabase
+    const { data: participant, error: partError } = await supabaseUser
       .from('competition_participants')
       .select('id, status')
       .eq('competition_id', competition_id)
@@ -234,7 +241,7 @@ serve(async (req) => {
       });
     }
 
-    const { data: account, error: accError } = await supabase
+    const { data: account, error: accError } = await supabaseUser
       .from('accounts')
       .select('id, balance, equity, used_margin, peak_equity, max_drawdown_pct, status')
       .eq('participant_id', participant.id)
@@ -255,7 +262,6 @@ serve(async (req) => {
     }
 
     // Get price from centralized price engine
-    // BUY fills at ASK, SELL fills at BID
     let fillPrice: number;
     let entryBid: number;
     let entryAsk: number;
@@ -270,7 +276,7 @@ serve(async (req) => {
       console.log(`Price engine execution: side=${side}, bid=${entryBid}, ask=${entryAsk}, fillPrice=${fillPrice}`);
     } else {
       // Fallback: Use cached DB price or client price
-      const { data: latestPrice } = await supabase
+      const { data: latestPrice } = await supabaseUser
         .from('market_prices_latest')
         .select('price, bid, ask, ts')
         .eq('instrument_id', instrument_id)
@@ -283,7 +289,6 @@ serve(async (req) => {
         priceSource = 'db_cache';
         console.log(`Using DB cache: bid=${entryBid}, ask=${entryAsk}`);
       } else if (client_price && client_price > 0) {
-        // Last resort: use client price with synthetic spread
         const spread = client_price * 0.0001;
         entryBid = client_price - spread;
         entryAsk = client_price + spread;
@@ -298,12 +303,30 @@ serve(async (req) => {
       }
     }
 
-    // Calculate margin
+    /**
+     * Calculate Required Margin using the formula:
+     * Required Margin = (Trade Size × Asset Price) / Leverage
+     * 
+     * Where:
+     * - Trade Size = quantity × contract_size (notional value in base currency)
+     * - Asset Price = fillPrice for market orders, requested_price for limit/stop orders
+     * - Leverage = user-specified leverage
+     */
     const contractSize = Number(instrument.contract_size) || 1;
-    const notionalValue = quantity * contractSize * fillPrice;
+    const priceForMargin = order_type === 'market' ? fillPrice : requested_price!;
+    const notionalValue = quantity * contractSize * priceForMargin;
     const requiredMargin = notionalValue / leverage;
 
-    // Check max position size rule (based on margin, not notional)
+    console.log('Margin calculation:', {
+      quantity,
+      contractSize,
+      priceForMargin,
+      notionalValue,
+      leverage,
+      requiredMargin,
+    });
+
+    // Check max position size rule
     const maxMarginAllowed = (rules.max_position_pct / 100) * rules.starting_balance;
     if (requiredMargin > maxMarginAllowed) {
       return new Response(JSON.stringify({ 
@@ -314,7 +337,14 @@ serve(async (req) => {
       });
     }
 
-    // Check margin
+    /**
+     * Check Free Margin using the formula:
+     * Free Margin = Equity - Used Margin
+     * 
+     * Where:
+     * - Equity = Balance + Unrealized P&L (stored in accounts table)
+     * - Used Margin = Sum of all position margins (stored in accounts table)
+     */
     const freeMargin = account.equity - account.used_margin;
     if (requiredMargin > freeMargin) {
       return new Response(JSON.stringify({ 
@@ -325,8 +355,10 @@ serve(async (req) => {
       });
     }
     
-    // Handle pending orders (limit/stop)
+    // Handle pending orders (limit/stop) - use admin client to bypass RLS
     if (order_type !== 'market') {
+      console.log('Creating pending order:', { order_type, requested_price, account_id: account.id });
+      
       const orderData: Record<string, unknown> = {
         account_id: account.id,
         instrument_id,
@@ -338,7 +370,24 @@ serve(async (req) => {
         status: 'pending'
       };
       
-      const { data: pendingOrder, error: orderError } = await supabase
+      // Set limit_price for limit orders, stop_price for stop orders
+      if (order_type === 'limit') {
+        orderData.limit_price = requested_price;
+      } else if (order_type === 'stop') {
+        orderData.stop_price = requested_price;
+      } else if (order_type === 'stop_limit') {
+        // For stop-limit, the stop_price triggers the limit order at limit_price
+        // For now, use requested_price for both (can be enhanced later)
+        orderData.stop_price = requested_price;
+        orderData.limit_price = requested_price;
+      }
+      
+      // Add SL/TP if provided
+      if (stop_loss && stop_loss > 0) orderData.stop_loss = stop_loss;
+      if (take_profit && take_profit > 0) orderData.take_profit = take_profit;
+      
+      // Use admin client to bypass RLS for insert
+      const { data: pendingOrder, error: orderError } = await supabaseAdmin
         .from('orders')
         .insert(orderData)
         .select('id')
@@ -346,17 +395,23 @@ serve(async (req) => {
       
       if (orderError) {
         console.error('Failed to create pending order:', orderError);
-        return new Response(JSON.stringify({ error: 'Failed to create pending order' }), { 
+        return new Response(JSON.stringify({ 
+          error: `Failed to create pending order: ${orderError.message}` 
+        }), { 
           status: 500, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
         });
       }
+      
+      console.log('Pending order created:', pendingOrder?.id, 'type:', order_type, 'price:', requested_price);
       
       return new Response(JSON.stringify({
         success: true,
         order_id: pendingOrder?.id,
         order_type,
         requested_price,
+        limit_price: order_type === 'limit' || order_type === 'stop_limit' ? requested_price : undefined,
+        stop_price: order_type === 'stop' || order_type === 'stop_limit' ? requested_price : undefined,
         status: 'pending',
         symbol: instrument.symbol
       }), {
@@ -368,7 +423,7 @@ serve(async (req) => {
     let existingPosition = null;
     
     if (!create_new_position) {
-      const { data: pos } = await supabase
+      const { data: pos } = await supabaseUser
         .from('positions')
         .select('id, side, quantity, entry_price, margin_used, realized_pnl, opened_at')
         .eq('account_id', account.id)
@@ -390,7 +445,7 @@ serve(async (req) => {
         const avgPrice = ((oldQty * oldPrice) + (quantity * fillPrice)) / newQty;
         const newMargin = Number(existingPosition.margin_used) + requiredMargin;
 
-        const { error: updatePosError } = await supabase
+        const { error: updatePosError } = await supabaseAdmin
           .from('positions')
           .update({
             quantity: newQty,
@@ -421,7 +476,7 @@ serve(async (req) => {
           
           const realizedPnl = priceDiff * existingQty * contractSize;
 
-          await supabase
+          await supabaseAdmin
             .from('positions')
             .update({
               status: 'closed',
@@ -431,7 +486,7 @@ serve(async (req) => {
             })
             .eq('id', existingPosition.id);
 
-          await supabase.from('trades').insert({
+          await supabaseAdmin.from('trades').insert({
             account_id: account.id,
             position_id: existingPosition.id,
             instrument_id,
@@ -451,7 +506,7 @@ serve(async (req) => {
             const newNotional = remainingQty * contractSize * fillPrice;
             const newPosMargin = newNotional / leverage;
 
-            const { data: newPos } = await supabase
+            const { data: newPos } = await supabaseAdmin
               .from('positions')
               .insert({
                 account_id: account.id,
@@ -475,7 +530,7 @@ serve(async (req) => {
             positionId = existingPosition.id;
           }
 
-          await supabase
+          await supabaseAdmin
             .from('accounts')
             .update({
               balance: newBalance,
@@ -493,7 +548,7 @@ serve(async (req) => {
           const realizedPnl = priceDiff * quantity * contractSize;
           const marginReduction = (quantity / existingQty) * Number(existingPosition.margin_used);
 
-          await supabase
+          await supabaseAdmin
             .from('positions')
             .update({
               quantity: remainingQty,
@@ -505,7 +560,7 @@ serve(async (req) => {
           positionId = existingPosition.id;
           newUsedMargin -= marginReduction;
 
-          await supabase
+          await supabaseAdmin
             .from('accounts')
             .update({
               balance: account.balance + realizedPnl,
@@ -533,7 +588,7 @@ serve(async (req) => {
       if (stop_loss && stop_loss > 0) positionData.stop_loss = stop_loss;
       if (take_profit && take_profit > 0) positionData.take_profit = take_profit;
       
-      const { data: newPosition, error: posError } = await supabase
+      const { data: newPosition, error: posError } = await supabaseAdmin
         .from('positions')
         .insert(positionData)
         .select('id')
@@ -565,7 +620,7 @@ serve(async (req) => {
       status: 'filled'
     };
     
-    const { data: order, error: orderError } = await supabase
+    const { data: order, error: orderError } = await supabaseAdmin
       .from('orders')
       .insert(orderData)
       .select('id')
@@ -576,33 +631,38 @@ serve(async (req) => {
     }
 
     // Update account used_margin
-    await supabase
+    await supabaseAdmin
       .from('accounts')
       .update({ used_margin: newUsedMargin })
       .eq('id', account.id);
 
     // Calculate and check drawdown
-    const { data: updatedAccount } = await supabase
+    const { data: updatedAccount } = await supabaseAdmin
       .from('accounts')
       .select('balance, equity, used_margin, peak_equity')
       .eq('id', account.id)
       .single();
 
     if (updatedAccount) {
-      const { data: openPositions } = await supabase
+      const { data: openPositions } = await supabaseAdmin
         .from('positions')
         .select('unrealized_pnl')
         .eq('account_id', account.id)
         .eq('status', 'open');
 
       const totalUnrealizedPnl = openPositions?.reduce((sum: number, p: any) => sum + Number(p.unrealized_pnl || 0), 0) || 0;
+      
+      /**
+       * Calculate Equity using the formula:
+       * Equity = Balance + Unrealized P&L
+       */
       const currentEquity = updatedAccount.balance + totalUnrealizedPnl;
       const newPeakEquity = Math.max(updatedAccount.peak_equity, currentEquity);
       const drawdown = newPeakEquity > 0 
         ? ((newPeakEquity - currentEquity) / newPeakEquity) * 100 
         : 0;
 
-      await supabase
+      await supabaseAdmin
         .from('accounts')
         .update({
           equity: currentEquity,
@@ -615,17 +675,17 @@ serve(async (req) => {
       if (drawdown >= rules.max_drawdown_pct) {
         console.log('DRAWDOWN BREACH - Disqualifying account:', account.id);
 
-        await supabase
+        await supabaseAdmin
           .from('accounts')
           .update({ status: 'frozen' })
           .eq('id', account.id);
 
-        await supabase
+        await supabaseAdmin
           .from('competition_participants')
           .update({ status: 'disqualified' })
           .eq('id', participant.id);
 
-        await supabase.from('disqualifications').insert({
+        await supabaseAdmin.from('disqualifications').insert({
           competition_id,
           account_id: account.id,
           reason: `Maximum drawdown exceeded: ${drawdown.toFixed(2)}% (limit: ${rules.max_drawdown_pct}%)`
@@ -644,7 +704,7 @@ serve(async (req) => {
       }
 
       // Create equity snapshot
-      await supabase.from('equity_snapshots').insert({
+      await supabaseAdmin.from('equity_snapshots').insert({
         account_id: account.id,
         equity: currentEquity,
         balance: updatedAccount.balance,
@@ -678,3 +738,4 @@ serve(async (req) => {
     });
   }
 });
+

@@ -5,10 +5,18 @@
  * - Position management (open, close, reverse)
  * - Bracket editing (SL/TP) with drag support
  * - Real-time P&L calculation with contract size
- * - Account Manager integration
+ * - Account Manager integration with proper margin calculations
  * - Multiple accounts support (for competitions)
  * - P&L preview for SL/TP brackets
  * - Persistent SL/TP lines on chart reload
+ * - Pending orders (limit/stop) support
+ * 
+ * Margin Formulas:
+ * - Required Margin = (Trade Size × Asset Price) / Leverage
+ * - Used Margin = Sum of all Required Margins
+ * - Equity = Balance + Unrealized P&L
+ * - Free Margin = Equity - Used Margin
+ * - Margin Level = (Equity / Used Margin) × 100
  */
 
 import { supabase } from "@/integrations/supabase/client";
@@ -64,6 +72,7 @@ export enum StandardFormatterName {
   Status = "status",
   Symbol = "symbol",
   Type = "type",
+  Percent = "percent",
 }
 
 export const CommonAccountManagerColumnId = {
@@ -157,8 +166,12 @@ export class TradeArenaBroker {
   private _competitionId: string | undefined;
   private _userId: string;
   
+  // Watched values for Account Manager summary
   private _balanceValue: any;
   private _equityValue: any;
+  private _usedMarginValue: any;
+  private _freeMarginValue: any;
+  private _marginLevelValue: any;
   
   private _pollingInterval: NodeJS.Timeout | null = null;
   private _instrumentCache: Map<string, InstrumentCache> = new Map();
@@ -167,6 +180,7 @@ export class TradeArenaBroker {
   private _positions: Position[] = [];
   private _positionById: Map<string, Position> = new Map();
   private _orderById: Map<string, Order> = new Map();
+  private _pendingOrderById: Map<string, Order> = new Map(); // Separate map for DB pending orders
   private _initialDataLoaded: boolean = false;
   
   // Multiple accounts support
@@ -186,8 +200,12 @@ export class TradeArenaBroker {
     this._userId = config.userId;
     this._competitionId = config.competitionId;
 
+    // Initialize watched values for Account Manager
     this._balanceValue = this._host.factory.createWatchedValue(0);
     this._equityValue = this._host.factory.createWatchedValue(0);
+    this._usedMarginValue = this._host.factory.createWatchedValue(0);
+    this._freeMarginValue = this._host.factory.createWatchedValue(0);
+    this._marginLevelValue = this._host.factory.createWatchedValue(0);
 
     // Load accounts first, then initial data
     this._loadUserAccounts().then(() => {
@@ -310,6 +328,7 @@ export class TradeArenaBroker {
     this._positions = [];
     this._positionById.clear();
     this._orderById.clear();
+    this._pendingOrderById.clear();
 
     await this._loadInitialDataAndNotify();
     await this._updateAccountData();
@@ -408,6 +427,7 @@ export class TradeArenaBroker {
 
   private async _loadInitialDataAndNotify(): Promise<void> {
     await this._loadPositions();
+    await this._loadPendingOrders(); // Load limit/stop orders from DB
     await this._updateAccountData();
     
     // Notify TradingView of all positions
@@ -416,14 +436,14 @@ export class TradeArenaBroker {
       this._host.positionUpdate(position);
     }
     
-    // Notify TradingView of all bracket orders (SL/TP as pending orders)
+    // Notify TradingView of all orders (bracket + pending)
     for (const order of this._orderById.values()) {
-      console.log("[TradeArenaBroker] Notifying bracket order:", order.id, "parentId:", order.parentId);
+      console.log("[TradeArenaBroker] Notifying order:", order.id, "type:", order.type, "status:", order.status);
       this._host.orderUpdate(order);
     }
     
     this._initialDataLoaded = true;
-    console.log("[TradeArenaBroker] ✅ Initial data loaded and notified", this._positions.length, "positions,", this._orderById.size, "bracket orders");
+    console.log("[TradeArenaBroker] ✅ Initial data loaded and notified", this._positions.length, "positions,", this._orderById.size, "orders");
   }
 
   private async _loadPositions(): Promise<void> {
@@ -453,7 +473,12 @@ export class TradeArenaBroker {
 
       this._positions = [];
       this._positionById.clear();
-      this._orderById.clear();
+      // Clear only bracket orders, keep pending orders
+      for (const [id, order] of this._orderById.entries()) {
+        if (order.parentId && order.parentType === ParentType.Position) {
+          this._orderById.delete(id);
+        }
+      }
 
       for (const pos of (data || [])) {
         const avgPrice = Number(pos.entry_price);
@@ -487,9 +512,70 @@ export class TradeArenaBroker {
         this._createBracketOrdersForPosition(position);
       }
 
-      console.log("[TradeArenaBroker] 📊 Loaded", this._positions.length, "positions with", this._orderById.size, "bracket orders");
+      console.log("[TradeArenaBroker] 📊 Loaded", this._positions.length, "positions");
     } catch (error) {
       console.error("[TradeArenaBroker] _loadPositions error:", error);
+    }
+  }
+
+  /**
+   * Load pending limit/stop orders from the database
+   */
+  private async _loadPendingOrders(): Promise<void> {
+    try {
+      const { data, error } = await supabase
+        .from('orders')
+        .select(`
+          id,
+          side,
+          quantity,
+          order_type,
+          requested_price,
+          limit_price,
+          stop_price,
+          stop_loss,
+          take_profit,
+          status,
+          instrument_id,
+          instrument:instruments!inner(id, symbol, name)
+        `)
+        .eq('account_id', this._accountId)
+        .eq('status', 'pending');
+
+      if (error) {
+        console.error("[TradeArenaBroker] _loadPendingOrders error:", error);
+        return;
+      }
+
+      // Clear only pending orders (not bracket orders)
+      this._pendingOrderById.clear();
+
+      for (const ord of (data || [])) {
+        let orderType = OrderType.Market;
+        if (ord.order_type === 'limit') orderType = OrderType.Limit;
+        else if (ord.order_type === 'stop') orderType = OrderType.Stop;
+        else if (ord.order_type === 'stop_limit') orderType = OrderType.StopLimit;
+
+        const order: Order = {
+          id: ord.id,
+          symbol: ord.instrument?.symbol || 'UNKNOWN',
+          type: orderType,
+          side: ord.side === 'buy' ? Side.Buy : Side.Sell,
+          qty: Math.abs(Number(ord.quantity)),
+          status: OrderStatus.Working,
+          limitPrice: ord.limit_price ? Number(ord.limit_price) : (ord.requested_price && orderType === OrderType.Limit ? Number(ord.requested_price) : undefined),
+          stopPrice: ord.stop_price ? Number(ord.stop_price) : (ord.requested_price && orderType === OrderType.Stop ? Number(ord.requested_price) : undefined),
+          stopLoss: ord.stop_loss ? Number(ord.stop_loss) : undefined,
+          takeProfit: ord.take_profit ? Number(ord.take_profit) : undefined,
+        };
+
+        this._pendingOrderById.set(order.id, order);
+        this._orderById.set(order.id, order);
+      }
+
+      console.log("[TradeArenaBroker] 📋 Loaded", this._pendingOrderById.size, "pending orders");
+    } catch (error) {
+      console.error("[TradeArenaBroker] _loadPendingOrders error:", error);
     }
   }
 
@@ -541,6 +627,7 @@ export class TradeArenaBroker {
     const oldOrderIds = new Set(this._orderById.keys());
     
     await this._loadPositions();
+    await this._loadPendingOrders();
     
     // Notify positions
     for (const position of this._positions) {
@@ -554,19 +641,19 @@ export class TradeArenaBroker {
       }
     }
 
-    // Notify bracket orders
+    // Notify all orders
     for (const order of this._orderById.values()) {
       this._host.orderUpdate(order);
     }
 
-    // Cancel old bracket orders that no longer exist
+    // Cancel old orders that no longer exist
     for (const oldId of oldOrderIds) {
       if (!this._orderById.has(oldId)) {
         this._host.orderUpdate({ id: oldId, status: OrderStatus.Canceled } as Order);
       }
     }
     
-    console.log("[TradeArenaBroker] 🔄 Reloaded and notified", this._positions.length, "positions,", this._orderById.size, "bracket orders");
+    console.log("[TradeArenaBroker] 🔄 Reloaded and notified", this._positions.length, "positions,", this._orderById.size, "orders");
   }
 
   async positions(): Promise<Position[]> {
@@ -782,18 +869,43 @@ export class TradeArenaBroker {
       console.log("[TradeArenaBroker] ✅ Order placed:", data);
 
       const orderId = data.order_id || `order_${this._idsCounter++}`;
-      const order = this._createOrder(preOrder, orderId);
       
+      // Handle pending orders (limit/stop) differently from market orders
+      if (orderType !== 'market' && data.status === 'pending') {
+        // Create pending order locally and notify
+        const pendingOrder: Order = {
+          id: orderId,
+          symbol: preOrder.symbol,
+          type: preOrder.type,
+          side: preOrder.side,
+          qty: preOrder.qty,
+          status: OrderStatus.Working,
+          limitPrice: preOrder.limitPrice,
+          stopPrice: preOrder.stopPrice,
+          stopLoss: preOrder.stopLoss,
+          takeProfit: preOrder.takeProfit,
+        };
+        
+        this._pendingOrderById.set(orderId, pendingOrder);
+        this._orderById.set(orderId, pendingOrder);
+        this._host.orderUpdate(pendingOrder);
+        
+        toast.success(`${orderType.charAt(0).toUpperCase() + orderType.slice(1)} order placed`);
+        return { orderId };
+      }
+      
+      // Market order - create filled order
+      const order = this._createOrder(preOrder, orderId);
       order.price = data.filled_price;
       order.avgPrice = data.filled_price;
       order.last = data.filled_price;
       order.status = OrderStatus.Filled;
       
       this._updateOrder(order);
-      toast.success("Order placed successfully");
+      toast.success("Order filled successfully");
       await this._reloadAndNotifyPositions();
 
-      return {};
+      return { orderId };
 
     } catch (error: any) {
       console.error("[TradeArenaBroker] ❌ placeOrder error:", error);
@@ -827,13 +939,14 @@ export class TradeArenaBroker {
       }
     }
 
-    // Regular order modification
+    // Regular pending order modification
     try {
       const { error } = await supabase
         .from('orders')
         .update({
           limit_price: order.limitPrice,
           stop_price: order.stopPrice,
+          requested_price: order.limitPrice || order.stopPrice,
           stop_loss: order.stopLoss,
           take_profit: order.takeProfit,
           quantity: order.qty,
@@ -878,7 +991,7 @@ export class TradeArenaBroker {
       }
     }
 
-    // Regular order cancellation
+    // Regular pending order cancellation
     try {
       const { error } = await supabase
         .from('orders')
@@ -888,9 +1001,12 @@ export class TradeArenaBroker {
 
       if (error) throw new Error(error.message);
 
+      // Update local state
       if (order) {
         order.status = OrderStatus.Canceled;
-        this._updateOrder(order);
+        this._host.orderUpdate(order);
+        this._orderById.delete(orderId);
+        this._pendingOrderById.delete(orderId);
       }
 
       toast.success("Order cancelled successfully");
@@ -1004,6 +1120,16 @@ export class TradeArenaBroker {
     }
   }
 
+  /**
+   * Account Manager configuration
+   * 
+   * Displays:
+   * - Balance: Starting capital + realized P&L
+   * - Equity: Balance + Unrealized P&L  
+   * - Used Margin: Sum of all position margins
+   * - Free Margin: Equity - Used Margin
+   * - Margin Level: (Equity / Used Margin) × 100%
+   */
   accountManagerInfo() {
     return {
       accountTitle: "TradeArena",
@@ -1018,6 +1144,24 @@ export class TradeArenaBroker {
           text: "Equity",
           wValue: this._equityValue,
           formatter: StandardFormatterName.Fixed,
+          isDefault: true,
+        },
+        {
+          text: "Used Margin",
+          wValue: this._usedMarginValue,
+          formatter: StandardFormatterName.Fixed,
+          isDefault: true,
+        },
+        {
+          text: "Free Margin",
+          wValue: this._freeMarginValue,
+          formatter: StandardFormatterName.Fixed,
+          isDefault: true,
+        },
+        {
+          text: "Margin Level",
+          wValue: this._marginLevelValue,
+          formatter: StandardFormatterName.Percent,
           isDefault: true,
         },
       ],
@@ -1052,6 +1196,13 @@ export class TradeArenaBroker {
           alignment: "right",
           id: "limitPrice",
           dataFields: ["limitPrice"],
+          formatter: StandardFormatterName.FormatPrice,
+        },
+        {
+          label: "Stop",
+          alignment: "right",
+          id: "stopPrice",
+          dataFields: ["stopPrice"],
           formatter: StandardFormatterName.FormatPrice,
         },
         {
@@ -1168,23 +1319,109 @@ export class TradeArenaBroker {
     this._pollingInterval = setInterval(async () => {
       await this._updateAccountData();
       await this._updatePositionPrices();
+      await this._checkPendingOrderStatus();
     }, 5000);
   }
 
+  /**
+   * Update account data including margin calculations
+   * 
+   * Formulas:
+   * - Equity = Balance + Unrealized P&L
+   * - Free Margin = Equity - Used Margin
+   * - Margin Level = (Equity / Used Margin) × 100
+   */
   private async _updateAccountData(): Promise<void> {
     try {
       const { data } = await supabase
         .from('accounts')
-        .select('balance, equity')
+        .select('balance, equity, used_margin')
         .eq('id', this._accountId)
         .single();
 
       if (data) {
-        this._balanceValue.setValue(Number(data.balance || 0));
-        this._equityValue.setValue(Number(data.equity || 0));
+        const balance = Number(data.balance || 0);
+        const equity = Number(data.equity || 0);
+        const usedMargin = Number(data.used_margin || 0);
+        
+        // Calculate Free Margin = Equity - Used Margin
+        const freeMargin = equity - usedMargin;
+        
+        // Calculate Margin Level = (Equity / Used Margin) × 100
+        // If no margin is used, margin level is infinite (show as 0 or a high value)
+        const marginLevel = usedMargin > 0 ? (equity / usedMargin) * 100 : 0;
+
+        this._balanceValue.setValue(balance);
+        this._equityValue.setValue(equity);
+        this._usedMarginValue.setValue(usedMargin);
+        this._freeMarginValue.setValue(freeMargin);
+        this._marginLevelValue.setValue(marginLevel);
+        
+        console.log("[TradeArenaBroker] 💰 Account updated:", {
+          balance,
+          equity,
+          usedMargin,
+          freeMargin,
+          marginLevel: marginLevel.toFixed(2) + '%'
+        });
       }
     } catch (error) {
       console.error("[TradeArenaBroker] _updateAccountData error:", error);
+    }
+  }
+
+  /**
+   * Check if any pending orders have been filled or cancelled
+   */
+  private async _checkPendingOrderStatus(): Promise<void> {
+    if (this._pendingOrderById.size === 0) return;
+
+    try {
+      const orderIds = Array.from(this._pendingOrderById.keys());
+      
+      const { data, error } = await supabase
+        .from('orders')
+        .select('id, status, filled_price, filled_at')
+        .in('id', orderIds);
+
+      if (error) {
+        console.error("[TradeArenaBroker] _checkPendingOrderStatus error:", error);
+        return;
+      }
+
+      let needsReload = false;
+
+      for (const orderData of (data || [])) {
+        const order = this._pendingOrderById.get(orderData.id);
+        if (!order) continue;
+
+        if (orderData.status === 'filled') {
+          // Order was filled - update status and reload positions
+          order.status = OrderStatus.Filled;
+          order.avgPrice = orderData.filled_price;
+          order.price = orderData.filled_price;
+          this._host.orderUpdate(order);
+          this._pendingOrderById.delete(orderData.id);
+          this._orderById.delete(orderData.id);
+          needsReload = true;
+          toast.success(`Order filled at ${orderData.filled_price}`);
+        } else if (orderData.status === 'cancelled' || orderData.status === 'rejected') {
+          // Order was cancelled or rejected
+          order.status = orderData.status === 'cancelled' ? OrderStatus.Canceled : OrderStatus.Rejected;
+          this._host.orderUpdate(order);
+          this._pendingOrderById.delete(orderData.id);
+          this._orderById.delete(orderData.id);
+          if (orderData.status === 'rejected') {
+            toast.error("Order was rejected");
+          }
+        }
+      }
+
+      if (needsReload) {
+        await this._reloadAndNotifyPositions();
+      }
+    } catch (error) {
+      console.error("[TradeArenaBroker] _checkPendingOrderStatus error:", error);
     }
   }
 
@@ -1265,6 +1502,7 @@ export class TradeArenaBroker {
     this._instrumentCache.clear();
     this._positionById.clear();
     this._orderById.clear();
+    this._pendingOrderById.clear();
     this._positions = [];
     this._accounts = [];
   }

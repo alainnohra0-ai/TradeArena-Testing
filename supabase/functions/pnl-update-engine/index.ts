@@ -10,7 +10,14 @@ const corsHeaders = {
  * Position P&L Update Engine
  * 
  * Updates unrealized P&L for all open positions based on current market prices.
- * Also updates account equity values.
+ * Also updates account equity values using the proper formulas:
+ * 
+ * Formulas:
+ * - Unrealized P&L = (Current Price - Entry Price) × Quantity × Contract Size (for buy)
+ * - Unrealized P&L = (Entry Price - Current Price) × Quantity × Contract Size (for sell)
+ * - Equity = Balance + Total Unrealized P&L
+ * - Free Margin = Equity - Used Margin
+ * - Margin Level = (Equity / Used Margin) × 100%
  * 
  * Should be called periodically (e.g., every 5-10 seconds)
  */
@@ -103,7 +110,11 @@ serve(async (req) => {
         // For BUY, mark-to-market at BID; for SELL, mark-to-market at ASK
         const markPrice = pos.side === 'buy' ? priceData.bid : priceData.ask;
 
-        // Calculate unrealized P&L
+        /**
+         * Calculate Unrealized P&L using the formula:
+         * For BUY: Unrealized P&L = (Current Price - Entry Price) × Quantity × Contract Size
+         * For SELL: Unrealized P&L = (Entry Price - Current Price) × Quantity × Contract Size
+         */
         const entryPrice = Number(pos.entry_price);
         const qty = Number(pos.quantity);
         const priceDiff = pos.side === 'buy' 
@@ -139,14 +150,27 @@ serve(async (req) => {
       try {
         const { data: account, error: accError } = await supabase
           .from('accounts')
-          .select('balance, peak_equity, max_drawdown_pct')
+          .select('balance, used_margin, peak_equity, max_drawdown_pct')
           .eq('id', accountId)
           .single();
 
         if (accError || !account) continue;
 
+        /**
+         * Calculate Equity using the formula:
+         * Equity = Balance + Total Unrealized P&L
+         * 
+         * Where:
+         * - Balance = Starting capital + all realized P&L
+         * - Total Unrealized P&L = Sum of all open position unrealized P&L
+         */
         const newEquity = Number(account.balance) + totalUnrealizedPnl;
         const newPeakEquity = Math.max(Number(account.peak_equity), newEquity);
+        
+        /**
+         * Calculate Drawdown using the formula:
+         * Drawdown % = ((Peak Equity - Current Equity) / Peak Equity) × 100
+         */
         const drawdown = newPeakEquity > 0 
           ? ((newPeakEquity - newEquity) / newPeakEquity) * 100 
           : 0;
@@ -162,6 +186,13 @@ serve(async (req) => {
 
         if (!updateAccError) {
           results.accounts_updated++;
+          
+          // Log margin metrics for debugging
+          const usedMargin = Number(account.used_margin);
+          const freeMargin = newEquity - usedMargin;
+          const marginLevel = usedMargin > 0 ? (newEquity / usedMargin) * 100 : 0;
+          
+          console.log(`[P&L Engine] Account ${accountId}: Equity=${newEquity.toFixed(2)}, Used Margin=${usedMargin.toFixed(2)}, Free Margin=${freeMargin.toFixed(2)}, Margin Level=${marginLevel.toFixed(2)}%`);
         }
       } catch (err) {
         console.error(`[P&L Engine] Error updating account ${accountId}:`, err);
