@@ -36,49 +36,79 @@ async function fetchFromPriceEngine(symbol: string): Promise<PriceData | null> {
     
     if (data.prices && data.prices[symbol]) {
       const price = data.prices[symbol];
-      console.log(`Price engine returned for ${symbol}: bid=${price.bid}, ask=${price.ask}`);
       return { bid: price.bid, ask: price.ask, mid: price.mid };
     }
     
     return null;
   } catch (error) {
-    console.error(`Error fetching from price engine for ${symbol}:`, error);
+    console.error(`Error fetching from price engine:`, error);
     return null;
   }
 }
 
 serve(async (req) => {
+  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
+    console.log('=== CLOSE POSITION FUNCTION STARTED ===');
+    
     const authHeader = req.headers.get('Authorization');
     if (!authHeader?.startsWith('Bearer ')) {
+      console.error('No auth header');
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
         status: 401, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
-    const supabase = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_ANON_KEY')!,
-      { global: { headers: { Authorization: authHeader } } }
-    );
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
+    
+    console.log('Supabase URL:', supabaseUrl ? 'SET' : 'NOT SET');
+    console.log('Supabase Anon Key:', supabaseAnonKey ? 'SET' : 'NOT SET');
 
+    if (!supabaseUrl || !supabaseAnonKey) {
+      return new Response(JSON.stringify({ error: 'Server configuration error' }), { 
+        status: 500, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
+
+    // Create Supabase client with user's auth token
+    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: authHeader } }
+    });
+
+    // Get user
     const { data: { user }, error: userError } = await supabase.auth.getUser();
     
     if (userError || !user) {
       console.error('Auth error:', userError);
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+      return new Response(JSON.stringify({ error: 'Unauthorized', details: userError?.message }), { 
         status: 401, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
-    const userId = user.id;
-    const { position_id, competition_id, client_price } = await req.json();
+    console.log('User authenticated:', user.id);
+
+    // Parse request body
+    let body;
+    try {
+      body = await req.json();
+    } catch (e) {
+      console.error('Failed to parse request body:', e);
+      return new Response(JSON.stringify({ error: 'Invalid request body' }), { 
+        status: 400, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
+
+    const { position_id, competition_id } = body;
+    console.log('Request:', { position_id, competition_id });
 
     if (!position_id || !competition_id) {
       return new Response(JSON.stringify({ error: 'position_id and competition_id are required' }), { 
@@ -87,15 +117,21 @@ serve(async (req) => {
       });
     }
 
-    console.log('Close position request:', { userId, position_id, competition_id });
-
-    // Verify user owns this position
-    const { data: participant } = await supabase
+    // Get participant
+    const { data: participant, error: participantError } = await supabase
       .from('competition_participants')
       .select('id')
       .eq('competition_id', competition_id)
-      .eq('user_id', userId)
+      .eq('user_id', user.id)
       .single();
+
+    if (participantError) {
+      console.error('Participant query error:', participantError);
+      return new Response(JSON.stringify({ error: 'Failed to verify participation', details: participantError.message }), { 
+        status: 500, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
 
     if (!participant) {
       return new Response(JSON.stringify({ error: 'Not participating in this competition' }), { 
@@ -104,11 +140,22 @@ serve(async (req) => {
       });
     }
 
-    const { data: account } = await supabase
+    console.log('Participant found:', participant.id);
+
+    // Get account
+    const { data: account, error: accountError } = await supabase
       .from('accounts')
       .select('id, balance, used_margin, peak_equity, max_drawdown_pct')
       .eq('participant_id', participant.id)
       .single();
+
+    if (accountError) {
+      console.error('Account query error:', accountError);
+      return new Response(JSON.stringify({ error: 'Failed to get account', details: accountError.message }), { 
+        status: 500, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
 
     if (!account) {
       return new Response(JSON.stringify({ error: 'Account not found' }), { 
@@ -116,6 +163,8 @@ serve(async (req) => {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
+
+    console.log('Account found:', account.id);
 
     // Get position
     const { data: position, error: posError } = await supabase
@@ -126,12 +175,22 @@ serve(async (req) => {
       .eq('status', 'open')
       .single();
 
-    if (posError || !position) {
+    if (posError) {
+      console.error('Position query error:', posError);
+      return new Response(JSON.stringify({ error: 'Failed to get position', details: posError.message }), { 
+        status: 500, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
+
+    if (!position) {
       return new Response(JSON.stringify({ error: 'Position not found or already closed' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
+
+    console.log('Position found:', position.id, 'Status:', position.status);
 
     // Get instrument
     const { data: instrument } = await supabase
@@ -143,12 +202,12 @@ serve(async (req) => {
     const contractSize = Number(instrument?.contract_size || 1);
     const symbol = instrument?.symbol || '';
 
-    // Get close price from centralized price engine
-    // Closing a BUY position = SELL at BID
-    // Closing a SELL position = BUY at ASK
+    console.log('Instrument:', symbol, 'Contract size:', contractSize);
+
+    // Get close price
     let closePrice: number;
-    let exitBid: number;
-    let exitAsk: number;
+    let exitBid: number = 0;
+    let exitAsk: number = 0;
     let priceSource: string = 'price-engine';
 
     const priceEngineResult = await fetchFromPriceEngine(symbol);
@@ -157,36 +216,14 @@ serve(async (req) => {
       exitBid = priceEngineResult.bid;
       exitAsk = priceEngineResult.ask;
       closePrice = position.side === 'buy' ? exitBid : exitAsk;
-      console.log(`Price engine close: side=${position.side}, bid=${exitBid}, ask=${exitAsk}, closePrice=${closePrice}`);
+      console.log('Price from engine:', { exitBid, exitAsk, closePrice });
     } else {
-      // Fallback: Use cached DB price or client price
-      const { data: latestPrice } = await supabase
-        .from('market_prices_latest')
-        .select('price, bid, ask, ts')
-        .eq('instrument_id', position.instrument_id)
-        .single();
-
-      if (latestPrice && latestPrice.bid && latestPrice.ask) {
-        exitBid = latestPrice.bid;
-        exitAsk = latestPrice.ask;
-        closePrice = position.side === 'buy' ? exitBid : exitAsk;
-        priceSource = 'db_cache';
-        console.log(`Using DB cache for close: bid=${exitBid}, ask=${exitAsk}`);
-      } else if (client_price && client_price > 0) {
-        const spread = client_price * 0.0001;
-        exitBid = client_price - spread;
-        exitAsk = client_price + spread;
-        closePrice = position.side === 'buy' ? exitBid : exitAsk;
-        priceSource = 'client_fallback';
-        console.log(`Using client price fallback: ${client_price}`);
-      } else {
-        // Last resort: use entry price
-        closePrice = Number(position.entry_price);
-        exitBid = closePrice;
-        exitAsk = closePrice;
-        priceSource = 'entry_fallback';
-        console.warn('Using entry price as fallback for close');
-      }
+      // Fallback to entry price
+      closePrice = Number(position.entry_price);
+      exitBid = closePrice;
+      exitAsk = closePrice;
+      priceSource = 'entry_fallback';
+      console.log('Using entry price as fallback:', closePrice);
     }
 
     // Calculate P&L
@@ -198,16 +235,10 @@ serve(async (req) => {
     
     const realizedPnl = priceDiff * qty * contractSize;
 
-    console.log('Closing position:', { 
-      entry: entryPrice, 
-      exit: closePrice, 
-      qty, 
-      contractSize, 
-      pnl: realizedPnl,
-      source: priceSource
-    });
+    console.log('P&L calculation:', { entryPrice, closePrice, qty, priceDiff, realizedPnl });
 
     // Update position to closed
+    console.log('Updating position status to closed...');
     const { error: updateError } = await supabase
       .from('positions')
       .update({
@@ -219,15 +250,17 @@ serve(async (req) => {
       .eq('id', position_id);
 
     if (updateError) {
-      console.error('Failed to close position:', updateError);
-      return new Response(JSON.stringify({ error: 'Failed to close position' }), { 
+      console.error('Failed to update position:', updateError);
+      return new Response(JSON.stringify({ error: 'Failed to close position', details: updateError.message }), { 
         status: 500, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
+    console.log('Position updated successfully');
+
     // Create trade record
-    await supabase.from('trades').insert({
+    const { error: tradeError } = await supabase.from('trades').insert({
       account_id: account.id,
       position_id: position_id,
       instrument_id: position.instrument_id,
@@ -239,9 +272,14 @@ serve(async (req) => {
       opened_at: position.opened_at || new Date().toISOString()
     });
 
+    if (tradeError) {
+      console.error('Failed to create trade record:', tradeError);
+      // Don't fail for this
+    }
+
     // Update account
     const newBalance = account.balance + realizedPnl;
-    const newUsedMargin = account.used_margin - Number(position.margin_used);
+    const newUsedMargin = Math.max(0, account.used_margin - Number(position.margin_used));
 
     // Get remaining unrealized P&L
     const { data: openPositions } = await supabase
@@ -262,11 +300,13 @@ serve(async (req) => {
       .update({
         balance: newBalance,
         equity: newEquity,
-        used_margin: Math.max(0, newUsedMargin),
+        used_margin: newUsedMargin,
         peak_equity: newPeakEquity,
         max_drawdown_pct: Math.max(account.max_drawdown_pct, drawdown)
       })
       .eq('id', account.id);
+
+    console.log('Account updated:', { newBalance, newEquity, newUsedMargin });
 
     // Create equity snapshot
     await supabase.from('equity_snapshots').insert({
@@ -277,7 +317,7 @@ serve(async (req) => {
       max_drawdown_pct_so_far: Math.max(account.max_drawdown_pct, drawdown)
     });
 
-    console.log('Position closed successfully:', { position_id, realized_pnl: realizedPnl, source: priceSource });
+    console.log('=== CLOSE POSITION SUCCESS ===');
 
     return new Response(JSON.stringify({
       success: true,
@@ -286,15 +326,13 @@ serve(async (req) => {
       realized_pnl: realizedPnl,
       new_balance: newBalance,
       symbol,
-      price_source: priceSource,
-      exit_bid: exitBid,
-      exit_ask: exitAsk
+      price_source: priceSource
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
 
   } catch (error: unknown) {
-    console.error('Error in close-position:', error);
+    console.error('=== CLOSE POSITION ERROR ===', error);
     const message = error instanceof Error ? error.message : 'Internal server error';
     return new Response(JSON.stringify({ error: message }), {
       status: 500,
@@ -302,3 +340,4 @@ serve(async (req) => {
     });
   }
 });
+

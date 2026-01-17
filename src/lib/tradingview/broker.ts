@@ -1,17 +1,11 @@
 /**
  * TradeArena Broker Implementation - Based on TradingView broker-sample
- * 
- * CRITICAL UNDERSTANDING FROM TRADINGVIEW SAMPLE:
- * 1. Position objects MUST have takeProfit and stopLoss fields directly
- * 2. editPositionBrackets updates position AND can create bracket orders
- * 3. host.positionUpdate(position) needs the FULL position object
- * 4. Brackets are stored as separate Order objects with parentId pointing to position
  */
 
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 
-// TradingView Broker API enums (from broker-api.d.ts)
+// TradingView Broker API enums
 export enum ConnectionStatus {
   Connected = 1,
   Connecting = 2,
@@ -61,7 +55,6 @@ export const CommonAccountManagerColumnId = {
   Symbol: "symbol",
 };
 
-// TradingView Position interface - MUST include stopLoss and takeProfit
 export interface Position {
   id: string;
   symbol: string;
@@ -70,11 +63,11 @@ export interface Position {
   avgPrice: number;
   pl?: number;
   last?: number;
-  stopLoss?: number;    // CRITICAL: Must be on position for bracket editing
-  takeProfit?: number;  // CRITICAL: Must be on position for bracket editing
+  price?: number;
+  stopLoss?: number;
+  takeProfit?: number;
 }
 
-// TradingView Order interface
 export interface Order {
   id: string;
   symbol: string;
@@ -89,6 +82,8 @@ export interface Order {
   parentId?: string;
   parentType?: ParentType;
   last?: number;
+  price?: number;
+  avgPrice?: number;
 }
 
 export interface PreOrder {
@@ -123,10 +118,10 @@ interface InstrumentCache {
   contract_size: number;
 }
 
-/**
- * TradeArena Broker Class - Implements IBrokerTerminal
- * Based on TradingView's broker-sample implementation
- */
+function changeSide(side: Side): Side {
+  return side === Side.Buy ? Side.Sell : Side.Buy;
+}
+
 export class TradeArenaBroker {
   private _host: any;
   private _accountId: string;
@@ -138,11 +133,12 @@ export class TradeArenaBroker {
   
   private _pollingInterval: NodeJS.Timeout | null = null;
   private _instrumentCache: Map<string, InstrumentCache> = new Map();
+  private _idsCounter: number = 1;
   
-  // Store positions and orders in memory (like broker-sample does)
   private _positions: Position[] = [];
   private _positionById: Map<string, Position> = new Map();
   private _orderById: Map<string, Order> = new Map();
+  private _initialDataLoaded: boolean = false;
 
   constructor(
     host: any,
@@ -157,20 +153,14 @@ export class TradeArenaBroker {
     this._userId = config.userId;
     this._competitionId = config.competitionId;
 
-    // Create watched values for account summary
     this._balanceValue = this._host.factory.createWatchedValue(0);
     this._equityValue = this._host.factory.createWatchedValue(0);
 
-    // Initialize data
-    this._loadInitialData();
+    this._loadInitialDataAndNotify();
     this._startPolling();
     
     console.log("[TradeArenaBroker] Initialized", config);
   }
-
-  // ============================================================
-  // CONNECTION & ACCOUNT METHODS
-  // ============================================================
 
   connectionStatus(): ConnectionStatus {
     return ConnectionStatus.Connected;
@@ -187,10 +177,6 @@ export class TradeArenaBroker {
       currency: 'USD',
     }];
   }
-
-  // ============================================================
-  // SYMBOL METHODS
-  // ============================================================
 
   async isTradable(_symbol: string): Promise<boolean> {
     return true;
@@ -217,13 +203,16 @@ export class TradeArenaBroker {
     }
   }
 
-  // ============================================================
-  // DATA LOADING
-  // ============================================================
-
-  private async _loadInitialData(): Promise<void> {
+  private async _loadInitialDataAndNotify(): Promise<void> {
     await this._loadPositions();
     await this._updateAccountData();
+    
+    for (const position of this._positions) {
+      this._host.positionUpdate(position);
+    }
+    
+    this._initialDataLoaded = true;
+    console.log("[TradeArenaBroker] ✅ Initial data loaded and notified", this._positions.length, "positions");
   }
 
   private async _loadPositions(): Promise<void> {
@@ -250,21 +239,20 @@ export class TradeArenaBroker {
         return;
       }
 
-      // Clear existing positions
       this._positions = [];
       this._positionById.clear();
 
-      // Build position objects
       for (const pos of (data || [])) {
+        const avgPrice = Number(pos.entry_price);
         const position: Position = {
           id: pos.id,
           symbol: pos.instrument?.symbol || 'UNKNOWN',
           qty: Math.abs(Number(pos.quantity)),
           side: pos.side === 'buy' ? Side.Buy : Side.Sell,
-          avgPrice: Number(pos.entry_price),
+          avgPrice: avgPrice,
+          price: avgPrice,
           pl: Number(pos.unrealized_pnl || 0),
-          last: pos.current_price ? Number(pos.current_price) : Number(pos.entry_price),
-          // CRITICAL: Include stopLoss and takeProfit directly on position
+          last: pos.current_price ? Number(pos.current_price) : avgPrice,
           stopLoss: pos.stop_loss ? Number(pos.stop_loss) : undefined,
           takeProfit: pos.take_profit ? Number(pos.take_profit) : undefined,
         };
@@ -279,84 +267,39 @@ export class TradeArenaBroker {
     }
   }
 
-  // ============================================================
-  // POSITIONS - Required by IBrokerTerminal
-  // ============================================================
+  private async _reloadAndNotifyPositions(): Promise<void> {
+    const oldPositionIds = new Set(this._positionById.keys());
+    
+    await this._loadPositions();
+    
+    for (const position of this._positions) {
+      this._host.positionUpdate(position);
+    }
+    
+    for (const oldId of oldPositionIds) {
+      if (!this._positionById.has(oldId)) {
+        this._host.positionUpdate({ id: oldId, qty: 0 } as Position);
+      }
+    }
+    
+    console.log("[TradeArenaBroker] 🔄 Reloaded and notified", this._positions.length, "positions");
+  }
 
   async positions(): Promise<Position[]> {
-    // Return a copy of positions array (like broker-sample does)
     return this._positions.slice();
   }
 
-  // ============================================================
-  // ORDERS - Required by IBrokerTerminal
-  // ============================================================
-
   async orders(): Promise<Order[]> {
-    try {
-      const { data, error } = await supabase
-        .from('orders')
-        .select(`
-          id,
-          side,
-          quantity,
-          limit_price,
-          stop_price,
-          order_type,
-          status,
-          stop_loss,
-          take_profit,
-          instrument:instruments!inner(symbol, name)
-        `)
-        .eq('account_id', this._accountId)
-        .eq('status', 'pending');
-
-      if (error) {
-        console.error("[TradeArenaBroker] orders error:", error);
-        return [];
-      }
-
-      return (data || []).map((order: any) => {
-        let orderType = OrderType.Market;
-        if (order.order_type === 'limit') orderType = OrderType.Limit;
-        else if (order.order_type === 'stop') orderType = OrderType.Stop;
-        else if (order.order_type === 'stop_limit') orderType = OrderType.StopLimit;
-
-        return {
-          id: order.id,
-          symbol: order.instrument?.symbol || 'UNKNOWN',
-          type: orderType,
-          side: order.side === 'buy' ? Side.Buy : Side.Sell,
-          qty: Math.abs(Number(order.quantity)),
-          status: OrderStatus.Working,
-          limitPrice: order.limit_price ? Number(order.limit_price) : undefined,
-          stopPrice: order.stop_price ? Number(order.stop_price) : undefined,
-          stopLoss: order.stop_loss ? Number(order.stop_loss) : undefined,
-          takeProfit: order.take_profit ? Number(order.take_profit) : undefined,
-        };
-      });
-    } catch (error) {
-      console.error("[TradeArenaBroker] orders error:", error);
-      return [];
-    }
+    return Array.from(this._orderById.values());
   }
 
   async executions(_symbol: string): Promise<any[]> {
     return [];
   }
 
-  // ============================================================
-  // POSITION BRACKET EDITING - THE CRITICAL METHOD
-  // This is called when:
-  // - User clicks Edit button in Account Manager
-  // - User drags SL/TP lines on chart
-  // - User uses context menu "Edit position..."
-  // ============================================================
-
   async editPositionBrackets(positionId: string, brackets: Brackets): Promise<void> {
     console.log("[TradeArenaBroker] 🎯 editPositionBrackets called:", positionId, brackets);
 
-    // Get the position from our local cache
     const position = this._positionById.get(positionId);
     
     if (!position) {
@@ -365,7 +308,6 @@ export class TradeArenaBroker {
     }
 
     try {
-      // Call backend to update brackets
       const { data, error } = await supabase.functions.invoke('update-position-brackets', {
         body: {
           position_id: positionId,
@@ -379,12 +321,8 @@ export class TradeArenaBroker {
 
       console.log("[TradeArenaBroker] ✅ Backend updated brackets:", data);
 
-      // CRITICAL: Update local position object with new brackets
       position.stopLoss = brackets.stopLoss;
       position.takeProfit = brackets.takeProfit;
-
-      // CRITICAL: Notify TradingView that position has been updated
-      // This is what makes the chart update!
       this._host.positionUpdate(position);
 
       console.log("[TradeArenaBroker] ✅ positionUpdate called with:", position);
@@ -396,10 +334,6 @@ export class TradeArenaBroker {
       throw error;
     }
   }
-
-  // ============================================================
-  // INSTRUMENT HELPERS
-  // ============================================================
 
   private async _getInstrumentData(symbol: string): Promise<InstrumentCache> {
     if (this._instrumentCache.has(symbol)) {
@@ -426,11 +360,27 @@ export class TradeArenaBroker {
     return result;
   }
 
-  // ============================================================
-  // ORDER PLACEMENT
-  // ============================================================
+  private _createOrder(preOrder: PreOrder, orderId?: string): Order {
+    return {
+      id: orderId || `order_${this._idsCounter++}`,
+      symbol: preOrder.symbol,
+      type: preOrder.type || OrderType.Market,
+      side: preOrder.side || Side.Buy,
+      qty: preOrder.qty,
+      status: OrderStatus.Filled,
+      limitPrice: preOrder.limitPrice,
+      stopPrice: preOrder.stopPrice,
+      stopLoss: preOrder.stopLoss,
+      takeProfit: preOrder.takeProfit,
+    };
+  }
 
-  async placeOrder(preOrder: PreOrder): Promise<{ orderId: string }> {
+  private _updateOrder(order: Order): void {
+    this._orderById.set(order.id, order);
+    this._host.orderUpdate(order);
+  }
+
+  async placeOrder(preOrder: PreOrder): Promise<{ orderId?: string }> {
     console.log("[TradeArenaBroker] 📥 placeOrder:", preOrder);
 
     try {
@@ -439,6 +389,7 @@ export class TradeArenaBroker {
       }
 
       const instrument = await this._getInstrumentData(preOrder.symbol);
+      console.log("[TradeArenaBroker] Resolved instrument:", instrument);
 
       let orderType: 'market' | 'limit' | 'stop' | 'stop_limit' = 'market';
       if (preOrder.type === OrderType.Limit) orderType = 'limit';
@@ -460,6 +411,8 @@ export class TradeArenaBroker {
         create_new_position: !preOrder.isClose
       };
 
+      console.log("[TradeArenaBroker] Calling place-order with:", requestBody);
+
       const { data, error } = await supabase.functions.invoke('place-order', {
         body: requestBody,
       });
@@ -468,27 +421,27 @@ export class TradeArenaBroker {
       if (data?.error) throw new Error(data.error);
 
       console.log("[TradeArenaBroker] ✅ Order placed:", data);
-      toast.success("Order placed successfully");
 
-      // Reload positions after order placement
-      await this._loadPositions();
+      const orderId = data.order_id || `order_${this._idsCounter++}`;
+      const order = this._createOrder(preOrder, orderId);
       
-      // Notify TradingView to refresh
-      if (this._host.positionsFullUpdate) {
-        this._host.positionsFullUpdate();
-      }
+      order.price = data.filled_price;
+      order.avgPrice = data.filled_price;
+      order.last = data.filled_price;
+      order.status = OrderStatus.Filled;
+      
+      this._updateOrder(order);
+      toast.success("Order placed successfully");
+      await this._reloadAndNotifyPositions();
 
-      return { orderId: data.order_id || 'order_' + Date.now() };
+      return {};
+
     } catch (error: any) {
       console.error("[TradeArenaBroker] ❌ placeOrder error:", error);
       toast.error(error.message || "Failed to place order");
       throw error;
     }
   }
-
-  // ============================================================
-  // ORDER MODIFICATION
-  // ============================================================
 
   async modifyOrder(order: Order): Promise<void> {
     console.log("[TradeArenaBroker] 🔧 modifyOrder:", order);
@@ -509,17 +462,13 @@ export class TradeArenaBroker {
       if (error) throw new Error(error.message);
 
       toast.success("Order modified successfully");
-      this._host.orderUpdate(order);
+      this._updateOrder(order);
     } catch (error: any) {
       console.error("[TradeArenaBroker] ❌ modifyOrder error:", error);
       toast.error(error.message || "Failed to modify order");
       throw error;
     }
   }
-
-  // ============================================================
-  // ORDER CANCELLATION
-  // ============================================================
 
   async cancelOrder(orderId: string): Promise<void> {
     console.log("[TradeArenaBroker] 🚫 cancelOrder:", orderId);
@@ -533,6 +482,12 @@ export class TradeArenaBroker {
 
       if (error) throw new Error(error.message);
 
+      const order = this._orderById.get(orderId);
+      if (order) {
+        order.status = OrderStatus.Canceled;
+        this._updateOrder(order);
+      }
+
       toast.success("Order cancelled successfully");
     } catch (error: any) {
       console.error("[TradeArenaBroker] ❌ cancelOrder error:", error);
@@ -541,18 +496,31 @@ export class TradeArenaBroker {
     }
   }
 
-  // ============================================================
-  // POSITION CLOSING
-  // ============================================================
+  async cancelOrders(_symbol: string, _side: Side | undefined, ordersIds: string[]): Promise<void> {
+    console.log("[TradeArenaBroker] 🚫 cancelOrders:", ordersIds);
+    
+    await Promise.all(ordersIds.map((orderId: string) => {
+      return this.cancelOrder(orderId);
+    }));
+  }
 
   async closePosition(positionId: string): Promise<void> {
     console.log("[TradeArenaBroker] 🚪 closePosition:", positionId);
+
+    const position = this._positionById.get(positionId);
+    if (!position) {
+      console.error("[TradeArenaBroker] Position not in local cache:", positionId);
+      throw new Error("Position not found");
+    }
 
     try {
       if (!this._competitionId) {
         throw new Error("Competition ID is required to close positions");
       }
 
+      console.log("[TradeArenaBroker] Calling close-position edge function...");
+
+      // Use supabase.functions.invoke which handles auth automatically
       const { data, error } = await supabase.functions.invoke('close-position', {
         body: {
           position_id: positionId,
@@ -560,23 +528,27 @@ export class TradeArenaBroker {
         },
       });
 
-      if (error) throw new Error(error.message);
-      if (data?.error) throw new Error(data.error);
+      console.log("[TradeArenaBroker] Response - data:", data, "error:", error);
 
-      console.log("[TradeArenaBroker] ✅ Position closed:", data);
+      if (error) {
+        console.error("[TradeArenaBroker] Edge function error:", error);
+        throw new Error(error.message || "Edge function error");
+      }
+
+      if (data?.error) {
+        console.error("[TradeArenaBroker] Data contains error:", data.error);
+        throw new Error(data.error);
+      }
+
+      console.log("[TradeArenaBroker] ✅ Position closed successfully:", data);
       toast.success("Position closed successfully");
 
-      // Remove from local cache
-      const position = this._positionById.get(positionId);
-      if (position) {
-        // Set qty to 0 to indicate closed (like broker-sample does)
-        position.qty = 0;
-        this._host.positionUpdate(position);
-        
-        // Remove from arrays
-        this._positionById.delete(positionId);
-        this._positions = this._positions.filter(p => p.id !== positionId);
-      }
+      // Update local state
+      position.qty = 0;
+      this._host.positionUpdate(position);
+      
+      this._positionById.delete(positionId);
+      this._positions = this._positions.filter(p => p.id !== positionId);
 
     } catch (error: any) {
       console.error("[TradeArenaBroker] ❌ closePosition error:", error);
@@ -584,10 +556,6 @@ export class TradeArenaBroker {
       throw error;
     }
   }
-
-  // ============================================================
-  // POSITION REVERSAL
-  // ============================================================
 
   async reversePosition(positionId: string): Promise<void> {
     console.log("[TradeArenaBroker] 🔄 reversePosition:", positionId);
@@ -597,26 +565,28 @@ export class TradeArenaBroker {
       throw new Error("Position not found");
     }
 
+    const symbol = position.symbol;
+    const side = position.side;
+    const qty = position.qty;
+
     try {
-      // Close current and open opposite (like broker-sample)
+      await this.closePosition(positionId);
+      
       await this.placeOrder({
-        symbol: position.symbol,
-        side: position.side === Side.Buy ? Side.Sell : Side.Buy,
+        symbol: symbol,
+        side: changeSide(side),
         type: OrderType.Market,
-        qty: position.qty * 2, // Double qty to reverse
+        qty: qty,
       });
 
       toast.success("Position reversed successfully");
+
     } catch (error: any) {
       console.error("[TradeArenaBroker] ❌ reversePosition error:", error);
       toast.error(error.message || "Failed to reverse position");
       throw error;
     }
   }
-
-  // ============================================================
-  // ACCOUNT MANAGER INFO
-  // ============================================================
 
   accountManagerInfo() {
     return {
@@ -710,14 +680,14 @@ export class TradeArenaBroker {
           formatter: StandardFormatterName.Profit,
         },
         {
-          label: "SL",
+          label: "Stop Loss",
           alignment: "right",
           id: "stopLoss",
           dataFields: ["stopLoss"],
           formatter: StandardFormatterName.FormatPrice,
         },
         {
-          label: "TP",
+          label: "Take Profit",
           alignment: "right",
           id: "takeProfit",
           dataFields: ["takeProfit"],
@@ -762,10 +732,6 @@ export class TradeArenaBroker {
     return items;
   }
 
-  // ============================================================
-  // CHART CONTEXT MENU
-  // ============================================================
-
   async chartContextMenuActions(context: any, options?: any): Promise<any[]> {
     if (this._host.defaultContextMenuActions) {
       return this._host.defaultContextMenuActions(context, options);
@@ -773,23 +739,14 @@ export class TradeArenaBroker {
     return [];
   }
 
-  // ============================================================
-  // EQUITY SUBSCRIPTION (for Order Ticket risk calculation)
-  // ============================================================
-
   subscribeEquity(): void {
     console.log("[TradeArenaBroker] subscribeEquity");
-    // Send current equity
     this._host.equityUpdate?.(this._equityValue.value());
   }
 
   unsubscribeEquity(): void {
     console.log("[TradeArenaBroker] unsubscribeEquity");
   }
-
-  // ============================================================
-  // POLLING & CLEANUP
-  // ============================================================
 
   private _startPolling(): void {
     this._pollingInterval = setInterval(async () => {
@@ -816,7 +773,6 @@ export class TradeArenaBroker {
   }
 
   private async _updatePositionPrices(): Promise<void> {
-    // Update P&L for positions based on current prices
     for (const position of this._positions) {
       if (position.last) {
         const priceDiff = position.side === Side.Buy 
@@ -824,7 +780,6 @@ export class TradeArenaBroker {
           : position.avgPrice - position.last;
         position.pl = priceDiff * position.qty;
         
-        // Notify TradingView of P&L update
         this._host.plUpdate?.(position.symbol, position.pl);
         this._host.positionPartialUpdate?.(position.id, { pl: position.pl });
       }
@@ -839,11 +794,11 @@ export class TradeArenaBroker {
     }
     this._instrumentCache.clear();
     this._positionById.clear();
+    this._orderById.clear();
     this._positions = [];
   }
 }
 
-// Factory function
 export function createTradeArenaBroker(
   host: any,
   config: {
