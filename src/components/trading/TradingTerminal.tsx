@@ -180,8 +180,15 @@ export function TradingTerminal({
       widgetRef.current = new window.TradingView.widget(widgetConfig);
       window.tvWidget = widgetRef.current;
 
+      // Fallback timeout in case onChartReady doesn't fire
+      const readyTimeout = setTimeout(() => {
+        console.log("[TradingTerminal] Ready timeout - forcing ready state");
+        setIsReady(true);
+      }, 5000);
+
       widgetRef.current.onChartReady(() => {
         console.log("[TradingTerminal] Chart ready");
+        clearTimeout(readyTimeout);
         setIsReady(true);
       });
 
