@@ -129,14 +129,14 @@ serve(async (req) => {
       });
     }
     
-    if ((order_type === 'limit' || order_type === 'stop') && (!requested_price || requested_price <= 0)) {
+    if ((order_type === 'limit' || order_type === 'stop' || false) && (!requested_price || requested_price <= 0)) {
       return new Response(JSON.stringify({ error: 'Limit/Stop orders require a valid price' }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
-    console.log('Order request:', { userId, competition_id, instrument_id, side, quantity, leverage, order_type });
+    console.log('Order request:', { userId, competition_id, instrument_id, side, quantity, leverage, order_type, requested_price });
 
     // Verify competition is live
     const { data: competition, error: compError } = await supabase
@@ -146,6 +146,7 @@ serve(async (req) => {
       .single();
 
     if (compError || !competition) {
+      console.error('Competition not found:', compError);
       return new Response(JSON.stringify({ error: 'Competition not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -167,6 +168,7 @@ serve(async (req) => {
       .single();
 
     if (rulesError || !rules) {
+      console.error('Competition rules not found:', rulesError);
       return new Response(JSON.stringify({ error: 'Competition rules not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -182,6 +184,7 @@ serve(async (req) => {
       .single();
 
     if (instrError || !compInstrument) {
+      console.error('Instrument not allowed:', instrError);
       return new Response(JSON.stringify({ error: 'Instrument not allowed in this competition' }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -206,6 +209,7 @@ serve(async (req) => {
       .single();
 
     if (getInstrError || !instrument) {
+      console.error('Instrument not found:', getInstrError);
       return new Response(JSON.stringify({ error: 'Instrument not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -221,6 +225,7 @@ serve(async (req) => {
       .single();
 
     if (partError || !participant) {
+      console.error('Participant not found:', partError);
       return new Response(JSON.stringify({ error: 'You are not participating in this competition' }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -241,6 +246,7 @@ serve(async (req) => {
       .single();
 
     if (accError || !account) {
+      console.error('Account not found:', accError);
       return new Response(JSON.stringify({ error: 'Trading account not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -298,9 +304,10 @@ serve(async (req) => {
       }
     }
 
-    // Calculate margin
+    // Calculate margin (use requested_price for pending orders, fillPrice for market orders)
     const contractSize = Number(instrument.contract_size) || 1;
-    const notionalValue = quantity * contractSize * fillPrice;
+    const priceForMargin = order_type === 'market' ? fillPrice : (requested_price || fillPrice);
+    const notionalValue = quantity * contractSize * priceForMargin;
     const requiredMargin = notionalValue / leverage;
 
     // Check max position size rule (based on margin, not notional)
@@ -327,6 +334,7 @@ serve(async (req) => {
     
     // Handle pending orders (limit/stop)
     if (order_type !== 'market') {
+      // Build order data with proper columns for limit/stop orders
       const orderData: Record<string, unknown> = {
         account_id: account.id,
         instrument_id,
@@ -334,9 +342,19 @@ serve(async (req) => {
         order_type,
         quantity,
         leverage,
-        requested_price,
-        status: 'pending'
+        requested_price, // Keep for backward compatibility
+        status: 'pending',
+        stop_loss: stop_loss || null,
+        take_profit: take_profit || null,
       };
+      
+      // Set appropriate price column based on order type
+      if (order_type === 'limit') {
+        orderData.limit_price = requested_price;
+      } else if (order_type === 'stop') {
+        orderData.stop_price = requested_price;
+      
+      console.log('Creating pending order with data:', orderData);
       
       const { data: pendingOrder, error: orderError } = await supabase
         .from('orders')
@@ -346,11 +364,13 @@ serve(async (req) => {
       
       if (orderError) {
         console.error('Failed to create pending order:', orderError);
-        return new Response(JSON.stringify({ error: 'Failed to create pending order' }), { 
+        return new Response(JSON.stringify({ error: `Failed to create pending order: ${orderError.message}` }), { 
           status: 500, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
         });
       }
+      
+      console.log('Pending order created successfully:', pendingOrder?.id);
       
       return new Response(JSON.stringify({
         success: true,
@@ -551,7 +571,7 @@ serve(async (req) => {
       newUsedMargin += requiredMargin;
     }
 
-    // Create order record
+    // Create order record for market order
     const orderData: Record<string, unknown> = {
       account_id: account.id,
       instrument_id,
@@ -678,3 +698,4 @@ serve(async (req) => {
     });
   }
 });
+
