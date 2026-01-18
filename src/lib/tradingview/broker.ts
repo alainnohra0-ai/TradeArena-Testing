@@ -703,7 +703,11 @@ export class TradeArenaBroker {
         },
       });
 
-      if (error) throw new Error(error.message);
+      if (error) {
+        // Try to extract actual error message from data if available
+        const errorMessage = data?.error || error.message || "Failed to place order";
+        throw new Error(errorMessage);
+      }
       if (data?.error) throw new Error(data.error);
 
       console.log("[TradeArenaBroker] ✅ Backend updated brackets:", data);
@@ -879,7 +883,11 @@ export class TradeArenaBroker {
         body: requestBody,
       });
 
-      if (error) throw new Error(error.message);
+      if (error) {
+        // Try to extract actual error message from data if available
+        const errorMessage = data?.error || error.message || "Failed to place order";
+        throw new Error(errorMessage);
+      }
       if (data?.error) throw new Error(data.error);
 
       console.log("[TradeArenaBroker] ✅ Order placed:", data);
@@ -966,7 +974,11 @@ export class TradeArenaBroker {
         .eq('id', order.id)
         .eq('account_id', this._accountId);
 
-      if (error) throw new Error(error.message);
+      if (error) {
+        // Try to extract actual error message from data if available
+        const errorMessage = data?.error || error.message || "Failed to place order";
+        throw new Error(errorMessage);
+      }
 
       // Update local pending order
       if (this._pendingOrders.has(order.id)) {
@@ -1019,7 +1031,11 @@ export class TradeArenaBroker {
           .eq('id', orderId)
           .eq('account_id', this._accountId);
 
-        if (error) throw new Error(error.message);
+        if (error) {
+        // Try to extract actual error message from data if available
+        const errorMessage = data?.error || error.message || "Failed to place order";
+        throw new Error(errorMessage);
+      }
 
         pendingOrder.status = OrderStatus.Canceled;
         this._host.orderUpdate(pendingOrder);
@@ -1043,7 +1059,11 @@ export class TradeArenaBroker {
         .eq('id', orderId)
         .eq('account_id', this._accountId);
 
-      if (error) throw new Error(error.message);
+      if (error) {
+        // Try to extract actual error message from data if available
+        const errorMessage = data?.error || error.message || "Failed to place order";
+        throw new Error(errorMessage);
+      }
 
       this._host.orderUpdate({ id: orderId, status: OrderStatus.Canceled } as Order);
       toast.success("Order cancelled successfully");
