@@ -3,153 +3,210 @@ import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
-import type { Tables } from "@/integrations/supabase/types";
 
-type Competition = Tables<"competitions">;
-type CompetitionRules = Tables<"competition_rules">;
-
-export interface CompetitionWithDetails extends Competition {
-  rules?: CompetitionRules;
+export interface Competition {
+  id: string;
+  name: string;
+  description: string | null;
+  status: string;
+  starts_at: string;
+  ends_at: string;
+  entry_fee: number;
+  prize_pool: number;
+  max_participants: number | null;
+  winner_distribution: Record<string, number> | null;
+  created_at: string;
   participant_count?: number;
   user_participation?: {
     id: string;
     status: string;
-    account_id?: string;
+  } | null;
+  rules?: {
+    starting_balance: number;
+    max_drawdown_pct: number;
+    max_leverage_global: number;
+    max_position_pct: number;
+    min_trades: number;
+    allow_weekend_trading: boolean;
   } | null;
 }
 
-export function useCompetitions() {
+/**
+ * Fetch all competitions with participant count and user participation status
+ */
+export const useCompetitions = () => {
   const { user } = useAuth();
 
   return useQuery({
-    queryKey: ["competitions"],
+    queryKey: ["competitions", user?.id],
     queryFn: async () => {
-      // Fetch competitions with rules
+      // Fetch all competitions
       const { data: competitions, error } = await supabase
         .from("competitions")
-        .select(`
-          *,
-          competition_rules(*)
-        `)
+        .select("*")
         .in("status", ["upcoming", "live", "ended"])
-        .order("starts_at", { ascending: true });
+        .order("starts_at", { ascending: false });
 
       if (error) throw error;
 
-      // Get participant counts
-      const competitionIds = competitions?.map(c => c.id) || [];
-      const { data: counts } = await supabase
+      // Fetch participant counts for all competitions
+      const competitionIds = competitions.map((c) => c.id);
+      
+      const { data: participantCounts, error: countError } = await supabase
         .from("competition_participants")
         .select("competition_id")
         .in("competition_id", competitionIds);
 
-      const countMap = new Map<string, number>();
-      counts?.forEach(c => {
-        countMap.set(c.competition_id, (countMap.get(c.competition_id) || 0) + 1);
-      });
-
-      // Get user's participations
-      let userParticipations: Map<string, { id: string; status: string; account_id?: string }> = new Map();
-      if (user) {
-        const { data: participations } = await supabase
-          .from("competition_participants")
-          .select("id, competition_id, status, accounts(id)")
-          .eq("user_id", user.id);
-
-        participations?.forEach(p => {
-          const account = Array.isArray(p.accounts) ? p.accounts[0] : p.accounts;
-          userParticipations.set(p.competition_id, {
-            id: p.id,
-            status: p.status,
-            account_id: account?.id
-          });
-        });
+      if (countError) {
+        console.error("Error fetching participant counts:", countError);
       }
 
-      return competitions?.map(c => ({
-        ...c,
-        rules: Array.isArray(c.competition_rules) ? c.competition_rules[0] : c.competition_rules,
-        participant_count: countMap.get(c.id) || 0,
-        user_participation: userParticipations.get(c.id) || null
-      })) as CompetitionWithDetails[];
+      // Count participants per competition
+      const countMap: Record<string, number> = {};
+      participantCounts?.forEach((p) => {
+        countMap[p.competition_id] = (countMap[p.competition_id] || 0) + 1;
+      });
+
+      // Fetch user's participations if logged in
+      let userParticipations: Record<string, { id: string; status: string }> = {};
+      if (user) {
+        const { data: participations, error: partError } = await supabase
+          .from("competition_participants")
+          .select("id, competition_id, status")
+          .eq("user_id", user.id);
+
+        if (!partError && participations) {
+          participations.forEach((p) => {
+            userParticipations[p.competition_id] = {
+              id: p.id,
+              status: p.status,
+            };
+          });
+        }
+      }
+
+      // Combine data
+      return competitions.map((comp) => ({
+        ...comp,
+        participant_count: countMap[comp.id] || 0,
+        user_participation: userParticipations[comp.id] || null,
+      })) as Competition[];
     },
   });
-}
+};
 
-export function useCompetition(id: string) {
+/**
+ * Fetch a single competition with full details including rules
+ */
+export const useCompetition = (id: string) => {
   const { user } = useAuth();
 
   return useQuery({
-    queryKey: ["competition", id],
+    queryKey: ["competition", id, user?.id],
     queryFn: async () => {
+      if (!id) return null;
+
+      // Fetch competition with rules
       const { data: competition, error } = await supabase
         .from("competitions")
         .select(`
           *,
-          competition_rules(*)
+          competition_rules (
+            starting_balance,
+            max_drawdown_pct,
+            max_leverage_global,
+            max_position_pct,
+            min_trades,
+            allow_weekend_trading
+          )
         `)
         .eq("id", id)
         .single();
 
       if (error) throw error;
 
-      // Get participant count
-      const { count } = await supabase
+      // Fetch participant count
+      const { count, error: countError } = await supabase
         .from("competition_participants")
         .select("*", { count: "exact", head: true })
         .eq("competition_id", id);
 
-      // Get user participation
+      if (countError) {
+        console.error("Error fetching participant count:", countError);
+      }
+
+      // Fetch user participation if logged in
       let userParticipation = null;
       if (user) {
         const { data: participation } = await supabase
           .from("competition_participants")
-          .select("id, status, accounts(id)")
+          .select("id, status")
           .eq("competition_id", id)
           .eq("user_id", user.id)
           .maybeSingle();
 
-        if (participation) {
-          const account = Array.isArray(participation.accounts) ? participation.accounts[0] : participation.accounts;
-          userParticipation = {
-            id: participation.id,
-            status: participation.status,
-            account_id: account?.id
-          };
-        }
+        userParticipation = participation;
       }
+
+      // Format rules (handle array from join)
+      const rules = Array.isArray(competition.competition_rules)
+        ? competition.competition_rules[0]
+        : competition.competition_rules;
 
       return {
         ...competition,
-        rules: Array.isArray(competition.competition_rules) ? competition.competition_rules[0] : competition.competition_rules,
+        rules,
         participant_count: count || 0,
-        user_participation: userParticipation
-      } as CompetitionWithDetails;
+        user_participation: userParticipation,
+      } as Competition;
     },
     enabled: !!id,
   });
-}
+};
 
-export function useJoinCompetition() {
+/**
+ * Join a competition via edge function
+ */
+export const useJoinCompetition = () => {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const { session } = useAuth();
 
   return useMutation({
     mutationFn: async (competitionId: string) => {
+      // Get current session to ensure we have a valid token
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      
+      console.log("Join competition - Session check:", { 
+        hasSession: !!session, 
+        hasToken: !!session?.access_token,
+        sessionError 
+      });
+
       if (!session?.access_token) {
-        throw new Error("Please log in to join competitions");
+        // Try to refresh the session
+        const { data: { session: refreshedSession }, error: refreshError } = await supabase.auth.refreshSession();
+        
+        console.log("Refresh attempt:", { 
+          hasSession: !!refreshedSession, 
+          refreshError 
+        });
+
+        if (!refreshedSession?.access_token) {
+          throw new Error("Please log in again to join the competition");
+        }
       }
 
-      console.log("Joining competition:", competitionId);
-
+      // Now invoke the function - supabase client should include the auth header
       const { data, error } = await supabase.functions.invoke("join-competition", {
         body: { competition_id: competitionId },
       });
 
+      console.log("Join competition response:", { data, error });
+
       if (error) {
-        console.error("Join error:", error);
-        throw new Error(error.message || "Failed to join competition");
+        // Try to extract error message from response
+        const errorMessage = data?.error || error.message || "Failed to join competition";
+        throw new Error(errorMessage);
       }
 
       if (data?.error) {
@@ -159,15 +216,24 @@ export function useJoinCompetition() {
       return data;
     },
     onSuccess: (data, competitionId) => {
-      toast.success(data.message || "Successfully joined competition!");
+      // Invalidate queries to refresh data
       queryClient.invalidateQueries({ queryKey: ["competitions"] });
       queryClient.invalidateQueries({ queryKey: ["competition", competitionId] });
-      queryClient.invalidateQueries({ queryKey: ["user-participations"] });
+      queryClient.invalidateQueries({ queryKey: ["wallet"] });
+
+      toast.success(data.message || "Successfully joined competition!", {
+        description: `Starting balance: $${data.starting_balance?.toLocaleString()}`,
+      });
+
+      // Navigate to dashboard
       navigate(`/dashboard/${competitionId}`);
     },
     onError: (error: Error) => {
-      console.error("Join mutation error:", error);
-      toast.error(error.message || "Failed to join competition");
+      console.error("Join competition error:", error);
+      toast.error("Failed to join competition", {
+        description: error.message,
+      });
     },
   });
-}
+};
+

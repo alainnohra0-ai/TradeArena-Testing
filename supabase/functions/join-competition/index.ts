@@ -13,27 +13,40 @@ serve(async (req) => {
   }
 
   try {
-    // Validate auth
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+    // Get and validate auth header
     const authHeader = req.headers.get('Authorization');
+    
     if (!authHeader?.startsWith('Bearer ')) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+      return new Response(JSON.stringify({ error: 'Missing authorization header' }), { 
         status: 401, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
-    const supabase = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_ANON_KEY')!,
+    // Client with user's auth for verifying user
+    const supabaseUser = createClient(
+      supabaseUrl!,
+      supabaseAnonKey!,
       { global: { headers: { Authorization: authHeader } } }
     );
 
+    // Admin client for database operations (bypasses RLS)
+    const supabaseAdmin = createClient(
+      supabaseUrl!,
+      supabaseServiceKey!
+    );
+
     // Get user from auth header
-    const { data: { user }, error: userError } = await supabase.auth.getUser();
-    
+    const { data: { user }, error: userError } = await supabaseUser.auth.getUser();
+
     if (userError || !user) {
-      console.error('Auth error:', userError);
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+      return new Response(JSON.stringify({ 
+        error: 'Invalid or expired token'
+      }), { 
         status: 401, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
@@ -43,7 +56,17 @@ serve(async (req) => {
     console.log('User joining competition:', userId);
 
     // Parse and validate request body
-    const { competition_id } = await req.json();
+    let body;
+    try {
+      body = await req.json();
+    } catch (e) {
+      return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { 
+        status: 400, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
+
+    const { competition_id } = body;
     
     if (!competition_id || typeof competition_id !== 'string') {
       return new Response(JSON.stringify({ error: 'competition_id is required' }), { 
@@ -53,14 +76,13 @@ serve(async (req) => {
     }
 
     // Get competition details
-    const { data: competition, error: compError } = await supabase
+    const { data: competition, error: compError } = await supabaseAdmin
       .from('competitions')
-      .select('id, name, status, starts_at, ends_at, entry_fee')
+      .select('id, name, status, starts_at, ends_at, entry_fee, max_participants')
       .eq('id', competition_id)
       .single();
 
     if (compError || !competition) {
-      console.error('Competition not found:', compError);
       return new Response(JSON.stringify({ error: 'Competition not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -77,33 +99,55 @@ serve(async (req) => {
       });
     }
 
-    // Check if already joined
-    const { data: existingParticipant } = await supabase
+    // Check if already joined (with account - fully joined)
+    const { data: existingParticipant } = await supabaseAdmin
       .from('competition_participants')
-      .select('id')
+      .select('id, accounts(id)')
       .eq('competition_id', competition_id)
       .eq('user_id', userId)
       .single();
 
     if (existingParticipant) {
-      return new Response(JSON.stringify({ error: 'Already joined this competition' }), { 
-        status: 400, 
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-      });
+      // Check if they have an account (fully joined)
+      const accounts = existingParticipant.accounts as any;
+      if (accounts && (Array.isArray(accounts) ? accounts.length > 0 : accounts.id)) {
+        return new Response(JSON.stringify({ error: 'Already joined this competition' }), { 
+          status: 400, 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        });
+      }
+      
+      // Orphaned participant - clean it up
+      console.log('Cleaning up orphaned participant:', existingParticipant.id);
+      await supabaseAdmin
+        .from('competition_participants')
+        .delete()
+        .eq('id', existingParticipant.id);
+    }
+
+    // Check participant limit
+    if (competition.max_participants) {
+      const { count } = await supabaseAdmin
+        .from('competition_participants')
+        .select('*', { count: 'exact', head: true })
+        .eq('competition_id', competition_id);
+
+      if (count && count >= competition.max_participants) {
+        return new Response(JSON.stringify({ error: 'Competition is full' }), { 
+          status: 400, 
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+        });
+      }
     }
 
     // Get competition rules for starting balance
-    console.log('Fetching rules for competition:', competition_id);
-    const { data: rules, error: rulesError } = await supabase
+    const { data: rules, error: rulesError } = await supabaseAdmin
       .from('competition_rules')
       .select('starting_balance')
       .eq('competition_id', competition_id)
       .single();
 
-    console.log('Rules result:', { rules, rulesError });
-
     if (rulesError || !rules) {
-      console.error('Rules not found:', rulesError);
       return new Response(JSON.stringify({ error: 'Competition rules not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -114,15 +158,14 @@ serve(async (req) => {
 
     // Check wallet balance if entry fee > 0
     if (competition.entry_fee > 0) {
-      const { data: wallet, error: walletError } = await supabase
+      const { data: wallet, error: walletError } = await supabaseAdmin
         .from('wallet_accounts')
         .select('id, balance')
         .eq('user_id', userId)
         .single();
 
       if (walletError || !wallet) {
-        console.error('Wallet not found:', walletError);
-        return new Response(JSON.stringify({ error: 'Wallet not found' }), { 
+        return new Response(JSON.stringify({ error: 'Wallet not found. Please contact support.' }), { 
           status: 404, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
         });
@@ -138,13 +181,12 @@ serve(async (req) => {
       }
 
       // Deduct entry fee
-      const { error: deductError } = await supabase
+      const { error: deductError } = await supabaseAdmin
         .from('wallet_accounts')
         .update({ balance: wallet.balance - competition.entry_fee })
         .eq('id', wallet.id);
 
       if (deductError) {
-        console.error('Failed to deduct entry fee:', deductError);
         return new Response(JSON.stringify({ error: 'Failed to process entry fee' }), { 
           status: 500, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -152,7 +194,7 @@ serve(async (req) => {
       }
 
       // Record wallet transaction
-      await supabase.from('wallet_transactions').insert({
+      await supabaseAdmin.from('wallet_transactions').insert({
         wallet_account_id: wallet.id,
         type: 'entry_fee',
         amount: -competition.entry_fee,
@@ -162,13 +204,17 @@ serve(async (req) => {
       });
     }
 
-    // Create participant
-    const { data: participant, error: participantError } = await supabase
+    // Create participant and account in a single transaction-like flow
+    // Use upsert for participant to handle race conditions
+    const { data: participant, error: participantError } = await supabaseAdmin
       .from('competition_participants')
-      .insert({
+      .upsert({
         competition_id,
         user_id: userId,
         status: 'active'
+      }, {
+        onConflict: 'competition_id,user_id',
+        ignoreDuplicates: false
       })
       .select('id')
       .single();
@@ -181,8 +227,30 @@ serve(async (req) => {
       });
     }
 
+    console.log('Participant created/found:', participant.id);
+
+    // Check if account already exists for this participant
+    const { data: existingAccount } = await supabaseAdmin
+      .from('accounts')
+      .select('id, balance, equity')
+      .eq('participant_id', participant.id)
+      .single();
+
+    if (existingAccount) {
+      console.log('Account already exists:', existingAccount.id);
+      return new Response(JSON.stringify({
+        success: true,
+        participant_id: participant.id,
+        account_id: existingAccount.id,
+        starting_balance: existingAccount.balance,
+        message: `Already joined ${competition.name}`
+      }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
     // Create trading account
-    const { data: account, error: accountError } = await supabase
+    const { data: account, error: accountError } = await supabaseAdmin
       .from('accounts')
       .insert({
         participant_id: participant.id,
@@ -197,15 +265,19 @@ serve(async (req) => {
       .single();
 
     if (accountError || !account) {
-      console.error('Failed to create account:', accountError);
+      console.error('Failed to create account:', JSON.stringify(accountError, null, 2));
+      // Rollback: delete the participant
+      await supabaseAdmin.from('competition_participants').delete().eq('id', participant.id);
       return new Response(JSON.stringify({ error: 'Failed to create trading account' }), { 
         status: 500, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
+    console.log('Account created:', account.id);
+
     // Create initial equity snapshot
-    await supabase.from('equity_snapshots').insert({
+    await supabaseAdmin.from('equity_snapshots').insert({
       account_id: account.id,
       equity: startingBalance,
       balance: startingBalance,
@@ -234,3 +306,4 @@ serve(async (req) => {
     });
   }
 });
+
