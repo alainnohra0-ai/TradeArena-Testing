@@ -353,6 +353,7 @@ serve(async (req) => {
         orderData.limit_price = requested_price;
       } else if (order_type === 'stop') {
         orderData.stop_price = requested_price;
+      }
       
       console.log('Creating pending order with data:', orderData);
       
