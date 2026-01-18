@@ -154,6 +154,7 @@ interface AccountInfo {
   balance?: number;
   competitionId?: string;
   competitionName?: string;
+  maxLeverage?: number; // Competition's max leverage
 }
 
 function changeSide(side: Side): Side {
@@ -165,6 +166,7 @@ export class TradeArenaBroker {
   private _accountId: string;
   private _competitionId: string | undefined;
   private _userId: string;
+  private _maxLeverage: number = 5; // Default to conservative 5x, will be loaded from competition rules
   
   // Account metrics watched values for TradingView Account Manager
   private _balanceValue: any;
@@ -211,7 +213,9 @@ export class TradeArenaBroker {
 
     // Load accounts first, then initial data
     this._loadUserAccounts().then(() => {
-      this._loadInitialDataAndNotify();
+      this._loadCompetitionRules().then(() => {
+        this._loadInitialDataAndNotify();
+      });
     });
     this._startPolling();
     
@@ -224,6 +228,36 @@ export class TradeArenaBroker {
 
   currentAccount(): string {
     return this._accountId;
+  }
+
+  /**
+   * Load competition rules to get max leverage
+   */
+  private async _loadCompetitionRules(): Promise<void> {
+    if (!this._competitionId) {
+      console.log("[TradeArenaBroker] No competition ID, using default max leverage:", this._maxLeverage);
+      return;
+    }
+
+    try {
+      const { data: rules, error } = await supabase
+        .from('competition_rules')
+        .select('max_leverage_global')
+        .eq('competition_id', this._competitionId)
+        .single();
+
+      if (error) {
+        console.error("[TradeArenaBroker] Failed to load competition rules:", error);
+        return;
+      }
+
+      if (rules && rules.max_leverage_global) {
+        this._maxLeverage = Number(rules.max_leverage_global);
+        console.log("[TradeArenaBroker] ✅ Loaded max leverage from competition rules:", this._maxLeverage);
+      }
+    } catch (error) {
+      console.error("[TradeArenaBroker] _loadCompetitionRules error:", error);
+    }
   }
 
   /**
@@ -244,7 +278,11 @@ export class TradeArenaBroker {
             id,
             user_id,
             competition_id,
-            competition:competitions!inner(id, name)
+            competition:competitions!inner(
+              id, 
+              name,
+              rules:competition_rules(max_leverage_global)
+            )
           )
         `)
         .eq('participant.user_id', this._userId);
@@ -255,6 +293,7 @@ export class TradeArenaBroker {
           id: this._accountId,
           name: 'TradeArena Trading Account',
           currency: 'USD',
+          maxLeverage: 5,
         }];
         this._accountsLoaded = true;
         return;
@@ -266,19 +305,33 @@ export class TradeArenaBroker {
           id: this._accountId,
           name: 'TradeArena Trading Account',
           currency: 'USD',
+          maxLeverage: 5,
         }];
         this._accountsLoaded = true;
         return;
       }
 
-      this._accounts = data.map((row: any) => ({
-        id: row.id,
-        name: row.participant?.competition?.name || 'Trading Account',
-        currency: 'USD',
-        balance: row.balance,
-        competitionId: row.participant?.competition_id,
-        competitionName: row.participant?.competition?.name,
-      }));
+      this._accounts = data.map((row: any) => {
+        const rules = row.participant?.competition?.rules;
+        const maxLev = rules && rules.length > 0 ? Number(rules[0].max_leverage_global) : 5;
+        
+        return {
+          id: row.id,
+          name: row.participant?.competition?.name || 'Trading Account',
+          currency: 'USD',
+          balance: row.balance,
+          competitionId: row.participant?.competition_id,
+          competitionName: row.participant?.competition?.name,
+          maxLeverage: maxLev,
+        };
+      });
+
+      // Set max leverage for current account
+      const currentAccount = this._accounts.find(a => a.id === this._accountId);
+      if (currentAccount && currentAccount.maxLeverage) {
+        this._maxLeverage = currentAccount.maxLeverage;
+        console.log("[TradeArenaBroker] Set max leverage from current account:", this._maxLeverage);
+      }
 
       console.log("[TradeArenaBroker] ✅ Loaded", this._accounts.length, "accounts:", this._accounts);
       this._accountsLoaded = true;
@@ -289,6 +342,7 @@ export class TradeArenaBroker {
         id: this._accountId,
         name: 'TradeArena Trading Account',
         currency: 'USD',
+        maxLeverage: 5,
       }];
       this._accountsLoaded = true;
     }
@@ -325,6 +379,15 @@ export class TradeArenaBroker {
     if (account.competitionId) {
       this._competitionId = account.competitionId;
       console.log("[TradeArenaBroker] Updated competition ID from cache:", this._competitionId);
+    }
+
+    // Update max leverage for the new account
+    if (account.maxLeverage) {
+      this._maxLeverage = account.maxLeverage;
+      console.log("[TradeArenaBroker] Updated max leverage:", this._maxLeverage);
+    } else {
+      // Load competition rules if not cached
+      await this._loadCompetitionRules();
     }
     
     this._positions = [];
@@ -704,8 +767,8 @@ export class TradeArenaBroker {
       });
 
       if (error) {
-        // Try to extract actual error message from data if available
-        const errorMessage = data?.error || error.message || "Failed to place order";
+        // Extract actual error message from data if available
+        const errorMessage = data?.error || error.message || "Failed to update brackets";
         throw new Error(errorMessage);
       }
       if (data?.error) throw new Error(data.error);
@@ -816,9 +879,12 @@ export class TradeArenaBroker {
       throw new Error(`Instrument ${symbol} not found`);
     }
 
+    // Cap instrument leverage at competition's max leverage
+    const instrumentLeverage = Math.min(data.leverage_default || 10, this._maxLeverage);
+
     const result: InstrumentCache = { 
       id: data.id, 
-      leverage: data.leverage_default || 10,
+      leverage: instrumentLeverage,
       contract_size: data.contract_size || 100000
     };
     
@@ -860,9 +926,14 @@ export class TradeArenaBroker {
       let orderType: 'market' | 'limit' | 'stop' = 'market';
       if (preOrder.type === OrderType.Limit) orderType = 'limit';
       else if (preOrder.type === OrderType.Stop) orderType = 'stop';
-      else if (preOrder.type === OrderType.StopLimit) orderType = 'stop' // Map StopLimit to Stop;
+      else if (preOrder.type === OrderType.StopLimit) orderType = 'stop'; // Map StopLimit to Stop
 
-      const leverage = preOrder.leverage || instrument.leverage || 10;
+      // Use preOrder leverage if provided, otherwise use instrument leverage (already capped at competition max)
+      // Also ensure we never exceed competition max leverage
+      let leverage = preOrder.leverage || instrument.leverage || this._maxLeverage;
+      leverage = Math.min(leverage, this._maxLeverage);
+      
+      console.log("[TradeArenaBroker] Using leverage:", leverage, "(max allowed:", this._maxLeverage + ")");
 
       const requestBody = {
         competition_id: this._competitionId,
@@ -884,7 +955,7 @@ export class TradeArenaBroker {
       });
 
       if (error) {
-        // Try to extract actual error message from data if available
+        // Extract actual error message from data if available
         const errorMessage = data?.error || error.message || "Failed to place order";
         throw new Error(errorMessage);
       }
@@ -975,8 +1046,8 @@ export class TradeArenaBroker {
         .eq('account_id', this._accountId);
 
       if (error) {
-        // Try to extract actual error message from data if available
-        const errorMessage = data?.error || error.message || "Failed to place order";
+        // Fixed: removed undefined 'data' reference
+        const errorMessage = error.message || "Failed to modify order";
         throw new Error(errorMessage);
       }
 
@@ -1032,10 +1103,10 @@ export class TradeArenaBroker {
           .eq('account_id', this._accountId);
 
         if (error) {
-        // Try to extract actual error message from data if available
-        const errorMessage = data?.error || error.message || "Failed to place order";
-        throw new Error(errorMessage);
-      }
+          // Fixed: removed undefined 'data' reference
+          const errorMessage = error.message || "Failed to cancel order";
+          throw new Error(errorMessage);
+        }
 
         pendingOrder.status = OrderStatus.Canceled;
         this._host.orderUpdate(pendingOrder);
@@ -1060,8 +1131,8 @@ export class TradeArenaBroker {
         .eq('account_id', this._accountId);
 
       if (error) {
-        // Try to extract actual error message from data if available
-        const errorMessage = data?.error || error.message || "Failed to place order";
+        // Fixed: removed undefined 'data' reference
+        const errorMessage = error.message || "Failed to cancel order";
         throw new Error(errorMessage);
       }
 
@@ -1109,7 +1180,9 @@ export class TradeArenaBroker {
 
       if (error) {
         console.error("[TradeArenaBroker] Edge function error:", error);
-        throw new Error(error.message || "Edge function error");
+        // Extract actual error message from data if available
+        const errorMessage = data?.error || error.message || "Edge function error";
+        throw new Error(errorMessage);
       }
 
       if (data?.error) {

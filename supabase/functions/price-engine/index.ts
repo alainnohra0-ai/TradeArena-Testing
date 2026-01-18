@@ -43,7 +43,14 @@ const TWELVE_DATA_SYMBOL_MAP: Record<string, string> = {
   'US500': 'SPY',
   'US30': 'DIA',
   'US100': 'QQQ',
+  // Add SPX mapping - using SPY as proxy (SPY tracks S&P 500, need to multiply by ~10)
+  'SPX': 'SPY',
+  // Add NAS100 as alias for US100
+  'NAS100': 'QQQ',
 };
+
+// SPX multiplier (SPY price * ~10 = SPX approximate price)
+const SPX_MULTIPLIER = 10;
 
 // Calculate spread based on asset type
 function getSpread(symbol: string, price: number): number {
@@ -52,7 +59,7 @@ function getSpread(symbol: string, price: number): number {
     spreadPct = 0.0003; // 3 pips for metals
   } else if (symbol.includes('BTC') || symbol.includes('ETH') || symbol.includes('SOL') || symbol.includes('BNB') || symbol.includes('XRP')) {
     spreadPct = 0.001; // 10 pips for crypto
-  } else if (symbol.includes('US')) {
+  } else if (symbol.includes('US') || symbol === 'SPX' || symbol === 'NAS100') {
     spreadPct = 0.0002; // 2 pips for indices
   }
   return price * spreadPct;
@@ -83,7 +90,13 @@ async function fetchSingleFromTwelveData(symbol: string, apiKey: string): Promis
     }
     
     if (data.price) {
-      const price = parseFloat(data.price);
+      let price = parseFloat(data.price);
+      
+      // Apply SPX multiplier if this is SPX (SPY * 10 ≈ SPX)
+      if (symbol === 'SPX') {
+        price = price * SPX_MULTIPLIER;
+      }
+      
       const spread = getSpread(symbol, price);
       
       console.log(`Twelve Data price for ${symbol}: ${price}`);
@@ -119,11 +132,13 @@ async function fetchBatchFromTwelveData(symbols: string[], apiKey: string): Prom
   if (symbolPairs.length === 0) return results;
   
   // Twelve Data batch endpoint: comma-separated symbols
-  const twelveSymbols = symbolPairs.map(p => p.twelveData).join(',');
+  // Note: deduplicate Twelve Data symbols to avoid redundant API calls
+  const uniqueTwelveSymbols = [...new Set(symbolPairs.map(p => p.twelveData))];
+  const twelveSymbols = uniqueTwelveSymbols.join(',');
   
   try {
     const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(twelveSymbols)}&apikey=${apiKey}`;
-    console.log(`Fetching batch from Twelve Data: ${symbolPairs.length} symbols`);
+    console.log(`Fetching batch from Twelve Data: ${uniqueTwelveSymbols.length} symbols`);
     
     const response = await fetch(url);
     
@@ -136,18 +151,26 @@ async function fetchBatchFromTwelveData(symbols: string[], apiKey: string): Prom
     const now = Date.now();
     
     // Handle single symbol response (not an object with symbol keys)
-    if (symbolPairs.length === 1) {
+    if (uniqueTwelveSymbols.length === 1) {
       if (data.price) {
-        const symbol = symbolPairs[0].original;
-        const price = parseFloat(data.price);
-        const spread = getSpread(symbol, price);
-        results.set(symbol, {
-          bid: price - spread / 2,
-          ask: price + spread / 2,
-          mid: price,
-          timestamp: now,
-          source: 'twelve_data'
-        });
+        // Apply to all original symbols that mapped to this Twelve Data symbol
+        for (const pair of symbolPairs) {
+          let price = parseFloat(data.price);
+          
+          // Apply SPX multiplier if this is SPX
+          if (pair.original === 'SPX') {
+            price = price * SPX_MULTIPLIER;
+          }
+          
+          const spread = getSpread(pair.original, price);
+          results.set(pair.original, {
+            bid: price - spread / 2,
+            ask: price + spread / 2,
+            mid: price,
+            timestamp: now,
+            source: 'twelve_data'
+          });
+        }
       }
       return results;
     }
@@ -156,7 +179,13 @@ async function fetchBatchFromTwelveData(symbols: string[], apiKey: string): Prom
     for (const pair of symbolPairs) {
       const priceData = data[pair.twelveData];
       if (priceData?.price) {
-        const price = parseFloat(priceData.price);
+        let price = parseFloat(priceData.price);
+        
+        // Apply SPX multiplier if this is SPX
+        if (pair.original === 'SPX') {
+          price = price * SPX_MULTIPLIER;
+        }
+        
         const spread = getSpread(pair.original, price);
         results.set(pair.original, {
           bid: price - spread / 2,
@@ -380,3 +409,4 @@ serve(async (req) => {
     });
   }
 });
+

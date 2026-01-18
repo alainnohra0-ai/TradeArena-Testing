@@ -32,6 +32,8 @@ async function fetchFromPriceEngine(symbol: string): Promise<PriceData | null> {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')!;
     
+    console.log(`Fetching price from price-engine for ${symbol}...`);
+    
     const response = await fetch(`${supabaseUrl}/functions/v1/price-engine`, {
       method: 'POST',
       headers: {
@@ -54,6 +56,7 @@ async function fetchFromPriceEngine(symbol: string): Promise<PriceData | null> {
       return { bid: price.bid, ask: price.ask, mid: price.mid };
     }
     
+    console.log(`Price engine returned no data for ${symbol}`);
     return null;
   } catch (error) {
     console.error(`Error fetching from price engine for ${symbol}:`, error);
@@ -62,36 +65,76 @@ async function fetchFromPriceEngine(symbol: string): Promise<PriceData | null> {
 }
 
 serve(async (req) => {
+  console.log('=== place-order function called ===');
+  console.log('Method:', req.method);
+  
   if (req.method === 'OPTIONS') {
+    console.log('Handling OPTIONS preflight');
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
+    // Check auth header
     const authHeader = req.headers.get('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+    console.log('Auth header present:', !!authHeader);
+    console.log('Auth header starts with Bearer:', authHeader?.startsWith('Bearer '));
+    
+    if (!authHeader) {
+      console.error('No Authorization header');
+      return new Response(JSON.stringify({ error: 'No authorization header' }), { 
+        status: 401, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
+    
+    if (!authHeader.startsWith('Bearer ')) {
+      console.error('Auth header does not start with Bearer');
+      return new Response(JSON.stringify({ error: 'Invalid authorization format' }), { 
         status: 401, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
-    const supabase = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_ANON_KEY')!,
-      { global: { headers: { Authorization: authHeader } } }
-    );
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
+    
+    console.log('SUPABASE_URL present:', !!supabaseUrl);
+    console.log('SUPABASE_ANON_KEY present:', !!supabaseAnonKey);
+    
+    if (!supabaseUrl || !supabaseAnonKey) {
+      console.error('Missing SUPABASE_URL or SUPABASE_ANON_KEY');
+      return new Response(JSON.stringify({ error: 'Server configuration error' }), { 
+        status: 500, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
 
+    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: authHeader } }
+    });
+
+    console.log('Getting user from token...');
     const { data: { user }, error: userError } = await supabase.auth.getUser();
     
-    if (userError || !user) {
-      console.error('Auth error:', userError);
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+    if (userError) {
+      console.error('Auth getUser error:', userError.message);
+      return new Response(JSON.stringify({ error: `Auth error: ${userError.message}` }), { 
+        status: 401, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
+    
+    if (!user) {
+      console.error('No user returned from getUser');
+      return new Response(JSON.stringify({ error: 'User not found' }), { 
         status: 401, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
     const userId = user.id;
+    console.log('User authenticated:', userId);
+    
     const body: OrderRequest = await req.json();
     const { 
       competition_id, 
@@ -109,6 +152,7 @@ serve(async (req) => {
 
     // Input validation
     if (!competition_id || !instrument_id || !side || !quantity || !leverage) {
+      console.log('Missing required fields');
       return new Response(JSON.stringify({ error: 'Missing required fields' }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -129,7 +173,7 @@ serve(async (req) => {
       });
     }
     
-    if ((order_type === 'limit' || order_type === 'stop' || false) && (!requested_price || requested_price <= 0)) {
+    if ((order_type === 'limit' || order_type === 'stop') && (!requested_price || requested_price <= 0)) {
       return new Response(JSON.stringify({ error: 'Limit/Stop orders require a valid price' }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -139,14 +183,23 @@ serve(async (req) => {
     console.log('Order request:', { userId, competition_id, instrument_id, side, quantity, leverage, order_type, requested_price });
 
     // Verify competition is live
+    console.log('Checking competition...');
     const { data: competition, error: compError } = await supabase
       .from('competitions')
       .select('id, status')
       .eq('id', competition_id)
       .single();
 
-    if (compError || !competition) {
-      console.error('Competition not found:', compError);
+    if (compError) {
+      console.error('Competition query error:', compError.message);
+      return new Response(JSON.stringify({ error: `Competition error: ${compError.message}` }), { 
+        status: 404, 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
+    
+    if (!competition) {
+      console.error('Competition not found');
       return new Response(JSON.stringify({ error: 'Competition not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -154,13 +207,17 @@ serve(async (req) => {
     }
 
     if (competition.status !== 'live') {
-      return new Response(JSON.stringify({ error: 'Competition is not live' }), { 
+      console.log('Competition not live, status:', competition.status);
+      return new Response(JSON.stringify({ error: `Competition is not live (status: ${competition.status})` }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
+    console.log('Competition is live');
+
     // Get competition rules
+    console.log('Getting competition rules...');
     const { data: rules, error: rulesError } = await supabase
       .from('competition_rules')
       .select('max_drawdown_pct, max_leverage_global, max_position_pct, starting_balance')
@@ -168,14 +225,17 @@ serve(async (req) => {
       .single();
 
     if (rulesError || !rules) {
-      console.error('Competition rules not found:', rulesError);
+      console.error('Competition rules error:', rulesError?.message);
       return new Response(JSON.stringify({ error: 'Competition rules not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
+    console.log('Got rules:', rules);
+
     // Check instrument is allowed
+    console.log('Checking instrument is allowed...');
     const { data: compInstrument, error: instrError } = await supabase
       .from('competition_instruments')
       .select('instrument_id, leverage_max_override')
@@ -184,7 +244,7 @@ serve(async (req) => {
       .single();
 
     if (instrError || !compInstrument) {
-      console.error('Instrument not allowed:', instrError);
+      console.error('Instrument not allowed:', instrError?.message);
       return new Response(JSON.stringify({ error: 'Instrument not allowed in this competition' }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -201,7 +261,10 @@ serve(async (req) => {
       });
     }
 
+    console.log('Instrument allowed');
+
     // Get instrument details
+    console.log('Getting instrument details...');
     const { data: instrument, error: getInstrError } = await supabase
       .from('instruments')
       .select('id, symbol, contract_size, tick_size')
@@ -209,14 +272,17 @@ serve(async (req) => {
       .single();
 
     if (getInstrError || !instrument) {
-      console.error('Instrument not found:', getInstrError);
+      console.error('Instrument not found:', getInstrError?.message);
       return new Response(JSON.stringify({ error: 'Instrument not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       });
     }
 
+    console.log('Got instrument:', instrument.symbol);
+
     // Get participant and account
+    console.log('Getting participant...');
     const { data: participant, error: partError } = await supabase
       .from('competition_participants')
       .select('id, status')
@@ -225,7 +291,7 @@ serve(async (req) => {
       .single();
 
     if (partError || !participant) {
-      console.error('Participant not found:', partError);
+      console.error('Participant not found:', partError?.message);
       return new Response(JSON.stringify({ error: 'You are not participating in this competition' }), { 
         status: 400, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -239,6 +305,8 @@ serve(async (req) => {
       });
     }
 
+    console.log('Participant active, getting account...');
+
     const { data: account, error: accError } = await supabase
       .from('accounts')
       .select('id, balance, equity, used_margin, peak_equity, max_drawdown_pct, status')
@@ -246,7 +314,7 @@ serve(async (req) => {
       .single();
 
     if (accError || !account) {
-      console.error('Account not found:', accError);
+      console.error('Account not found:', accError?.message);
       return new Response(JSON.stringify({ error: 'Trading account not found' }), { 
         status: 404, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -260,13 +328,15 @@ serve(async (req) => {
       });
     }
 
+    console.log('Account active:', account.id);
+
     // Get price from centralized price engine
-    // BUY fills at ASK, SELL fills at BID
     let fillPrice: number;
     let entryBid: number;
     let entryAsk: number;
     let priceSource: string = 'price-engine';
 
+    console.log('Fetching price...');
     const marketPrice = await fetchFromPriceEngine(instrument.symbol);
     
     if (marketPrice) {
@@ -275,7 +345,7 @@ serve(async (req) => {
       fillPrice = side === 'buy' ? entryAsk : entryBid;
       console.log(`Price engine execution: side=${side}, bid=${entryBid}, ask=${entryAsk}, fillPrice=${fillPrice}`);
     } else {
-      // Fallback: Use cached DB price or client price
+      console.log('Price engine failed, trying DB cache...');
       const { data: latestPrice } = await supabase
         .from('market_prices_latest')
         .select('price, bid, ask, ts')
@@ -289,7 +359,6 @@ serve(async (req) => {
         priceSource = 'db_cache';
         console.log(`Using DB cache: bid=${entryBid}, ask=${entryAsk}`);
       } else if (client_price && client_price > 0) {
-        // Last resort: use client price with synthetic spread
         const spread = client_price * 0.0001;
         entryBid = client_price - spread;
         entryAsk = client_price + spread;
@@ -297,6 +366,7 @@ serve(async (req) => {
         priceSource = 'client_fallback';
         console.log(`Using client price fallback: ${client_price}`);
       } else {
+        console.error('Unable to fetch market price');
         return new Response(JSON.stringify({ error: 'Unable to fetch market price' }), { 
           status: 500, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -304,13 +374,15 @@ serve(async (req) => {
       }
     }
 
-    // Calculate margin (use requested_price for pending orders, fillPrice for market orders)
+    console.log('Got price, calculating margin...');
+
     const contractSize = Number(instrument.contract_size) || 1;
     const priceForMargin = order_type === 'market' ? fillPrice : (requested_price || fillPrice);
     const notionalValue = quantity * contractSize * priceForMargin;
     const requiredMargin = notionalValue / leverage;
 
-    // Check max position size rule (based on margin, not notional)
+    console.log('Margin calculation:', { contractSize, priceForMargin, notionalValue, requiredMargin });
+
     const maxMarginAllowed = (rules.max_position_pct / 100) * rules.starting_balance;
     if (requiredMargin > maxMarginAllowed) {
       return new Response(JSON.stringify({ 
@@ -321,7 +393,6 @@ serve(async (req) => {
       });
     }
 
-    // Check margin
     const freeMargin = account.equity - account.used_margin;
     if (requiredMargin > freeMargin) {
       return new Response(JSON.stringify({ 
@@ -332,9 +403,12 @@ serve(async (req) => {
       });
     }
     
+    console.log('Margin check passed');
+
     // Handle pending orders (limit/stop)
     if (order_type !== 'market') {
-      // Build order data with proper columns for limit/stop orders
+      console.log('Creating pending order...');
+      
       const orderData: Record<string, unknown> = {
         account_id: account.id,
         instrument_id,
@@ -342,13 +416,10 @@ serve(async (req) => {
         order_type,
         quantity,
         leverage,
-        requested_price, // Keep for backward compatibility
+        requested_price,
         status: 'pending',
-        stop_loss: stop_loss || null,
-        take_profit: take_profit || null,
       };
       
-      // Set appropriate price column based on order type
       if (order_type === 'limit') {
         orderData.limit_price = requested_price;
       } else if (order_type === 'stop') {
@@ -364,7 +435,7 @@ serve(async (req) => {
         .single();
       
       if (orderError) {
-        console.error('Failed to create pending order:', orderError);
+        console.error('Failed to create pending order:', orderError.message);
         return new Response(JSON.stringify({ error: `Failed to create pending order: ${orderError.message}` }), { 
           status: 500, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -379,13 +450,16 @@ serve(async (req) => {
         order_type,
         requested_price,
         status: 'pending',
-        symbol: instrument.symbol
+        symbol: instrument.symbol,
+        stop_loss: stop_loss || null,
+        take_profit: take_profit || null,
       }), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
-    // Market order execution - always create new position (no netting by default)
+    console.log('Processing market order...');
+
     let existingPosition = null;
     
     if (!create_new_position) {
@@ -403,8 +477,8 @@ serve(async (req) => {
     let newUsedMargin = account.used_margin;
 
     if (existingPosition) {
+      console.log('Modifying existing position...');
       if (existingPosition.side === side) {
-        // Add to existing position
         const oldQty = Number(existingPosition.quantity);
         const oldPrice = Number(existingPosition.entry_price);
         const newQty = oldQty + quantity;
@@ -422,7 +496,7 @@ serve(async (req) => {
           .eq('id', existingPosition.id);
 
         if (updatePosError) {
-          console.error('Failed to update position:', updatePosError);
+          console.error('Failed to update position:', updatePosError.message);
           return new Response(JSON.stringify({ error: 'Failed to update position' }), { 
             status: 500, 
             headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -432,7 +506,6 @@ serve(async (req) => {
         positionId = existingPosition.id;
         newUsedMargin += requiredMargin;
       } else {
-        // Opposite side - close/reduce
         const existingQty = Number(existingPosition.quantity);
         
         if (quantity >= existingQty) {
@@ -505,7 +578,6 @@ serve(async (req) => {
             .eq('id', account.id);
 
         } else {
-          // Partial close
           const remainingQty = existingQty - quantity;
           const priceDiff = side === 'buy'
             ? Number(existingPosition.entry_price) - fillPrice
@@ -536,7 +608,7 @@ serve(async (req) => {
         }
       }
     } else {
-      // Create new position
+      console.log('Creating new position...');
       const positionData: Record<string, unknown> = {
         account_id: account.id,
         instrument_id,
@@ -554,6 +626,8 @@ serve(async (req) => {
       if (stop_loss && stop_loss > 0) positionData.stop_loss = stop_loss;
       if (take_profit && take_profit > 0) positionData.take_profit = take_profit;
       
+      console.log('Position data:', positionData);
+      
       const { data: newPosition, error: posError } = await supabase
         .from('positions')
         .insert(positionData)
@@ -561,8 +635,8 @@ serve(async (req) => {
         .single();
 
       if (posError || !newPosition) {
-        console.error('Failed to create position:', posError);
-        return new Response(JSON.stringify({ error: 'Failed to create position' }), { 
+        console.error('Failed to create position:', posError?.message);
+        return new Response(JSON.stringify({ error: `Failed to create position: ${posError?.message}` }), { 
           status: 500, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
         });
@@ -570,9 +644,10 @@ serve(async (req) => {
 
       positionId = newPosition.id;
       newUsedMargin += requiredMargin;
+      console.log('Position created:', positionId);
     }
 
-    // Create order record for market order
+    console.log('Creating order record...');
     const orderData: Record<string, unknown> = {
       account_id: account.id,
       instrument_id,
@@ -593,16 +668,16 @@ serve(async (req) => {
       .single();
 
     if (orderError) {
-      console.error('Failed to create order:', orderError);
+      console.error('Failed to create order record:', orderError.message);
     }
 
-    // Update account used_margin
+    console.log('Updating account margin...');
     await supabase
       .from('accounts')
       .update({ used_margin: newUsedMargin })
       .eq('id', account.id);
 
-    // Calculate and check drawdown
+    console.log('Checking drawdown...');
     const { data: updatedAccount } = await supabase
       .from('accounts')
       .select('balance, equity, used_margin, peak_equity')
@@ -632,7 +707,6 @@ serve(async (req) => {
         })
         .eq('id', account.id);
 
-      // Check for drawdown breach
       if (drawdown >= rules.max_drawdown_pct) {
         console.log('DRAWDOWN BREACH - Disqualifying account:', account.id);
 
@@ -664,7 +738,6 @@ serve(async (req) => {
         });
       }
 
-      // Create equity snapshot
       await supabase.from('equity_snapshots').insert({
         account_id: account.id,
         equity: currentEquity,
